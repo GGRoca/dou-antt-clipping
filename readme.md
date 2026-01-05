@@ -107,3 +107,19 @@ python -m douclip run --config config.yml
 
 
 python -m douclip backfill --config config.yml --start 2021-12-23 --end 2025-12-31
+
+📌 Observações importantes
+
+O INLABS não tem horário fixo para edições extras.
+
+O projeto resolve isso por:
+
+múltiplas execuções diárias
+
+controle de arquivos já processados
+
+O sistema é idempotente: pode rodar várias vezes sem duplicar dados.
+
+📄 Licença
+
+Uso interno / institucional.
