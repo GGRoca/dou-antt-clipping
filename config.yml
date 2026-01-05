@@ -1,0 +1,20 @@
+inlabs:
+  base_url: "https://inlabs.in.gov.br"
+
+filters:
+  orgao_contains: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+  keywords_any:
+    - "outorga por autorização ferroviária"
+    - "autorização"
+
+mail:
+  enabled: true
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  from_email: "guilherme.artintel@gmail.com"
+  to_emails:
+    - "guiroca@gmail.com"
+  subject_prefix: "[DOU][ANTT][SUFER]"
+
+storage:
+  sqlite_path: "data/douclip.sqlite"
