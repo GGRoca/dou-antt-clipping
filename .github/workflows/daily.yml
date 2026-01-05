@@ -10,11 +10,22 @@ on:
     - cron: "8 1 * * *"    # 22:08 BRT
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    concurrency:
+      group: douclip-db
+      cancel-in-progress: false
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout main (code)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,6 +37,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 1) Puxa o banco do branch "data" (se existir)
+      - name: Fetch DB branch (data)
+        run: |
+          git fetch origin data:data || true
+
+      - name: Restore SQLite (if exists)
+        run: |
+          mkdir -p data
+          if git show data:data/douclip.sqlite > data/douclip.sqlite 2>/dev/null; then
+            echo "Restored existing DB from branch 'data'."
+          else
+            echo "No existing DB yet. Will create a new one."
+            rm -f data/douclip.sqlite || true
+          fi
+
+      # 2) Roda o clipping (atualiza/cria o banco)
       - name: Run clipping
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -33,17 +60,29 @@ jobs:
         run: |
           python -m douclip --config config.yml run
 
-      - name: Show generated files
+      - name: Verify DB exists
         run: |
-          echo "PWD=$(pwd)"
-          ls -la
-          echo "---- data/ ----"
-          ls -la data || true
-          test -f data/douclip.sqlite && echo "SQLite exists" || (echo "SQLite NOT found" && exit 1)
+          test -f data/douclip.sqlite && echo "DB OK: data/douclip.sqlite" || (echo "DB missing!" && exit 1)
+          ls -lh data/douclip.sqlite
 
-      - name: Upload SQLite artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: douclip-sqlite
-          path: data/douclip.sqlite
+      # 3) Comita o banco atualizado no branch "data"
+      - name: Commit DB to branch 'data'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # cria/atualiza branch data
+          if git show-ref --verify --quiet refs/heads/data; then
+            git checkout data
+          else
+            git checkout --orphan data
+            git rm -rf . || true
+          fi
+
+          mkdir -p data
+          # o banco está no workspace original; pega dele via caminho absoluto
+          cp -f "$GITHUB_WORKSPACE/data/douclip.sqlite" data/douclip.sqlite
+
+          git add data/douclip.sqlite
+          git commit -m "Update douclip.sqlite" || echo "No DB changes to commit."
+          git push origin data
