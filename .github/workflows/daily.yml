@@ -32,3 +32,18 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
           python -m douclip --config config.yml run
+
+      - name: Show generated files
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          echo "---- data/ ----"
+          ls -la data || true
+          test -f data/douclip.sqlite && echo "SQLite exists" || (echo "SQLite NOT found" && exit 1)
+
+      - name: Upload SQLite artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: douclip-sqlite
+          path: data/douclip.sqlite
+
