@@ -42,14 +42,19 @@ jobs:
         run: |
           git fetch origin data:data || true
 
-      - name: Restore SQLite (if exists)
+      - name: Restore SQLite from branch 'data' (if exists)
         run: |
           mkdir -p data
-          if git show data:data/douclip.sqlite > data/douclip.sqlite 2>/dev/null; then
-            echo "Restored existing DB from branch 'data'."
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch origin data
+            git show origin/data:data/douclip.sqlite > data/douclip.sqlite || true
+            if [ -f data/douclip.sqlite ]; then
+              echo "Restored DB from branch 'data'."
+            else
+              echo "No DB file in branch 'data' yet."
+            fi
           else
-            echo "No existing DB yet. Will create a new one."
-            rm -f data/douclip.sqlite || true
+            echo "Branch 'data' does not exist yet."
           fi
 
       # 2) Roda o clipping (atualiza/cria o banco)
@@ -68,21 +73,32 @@ jobs:
       # 3) Comita o banco atualizado no branch "data"
       - name: Commit DB to branch 'data'
         run: |
+          set -e
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # cria/atualiza branch data
-          if git show-ref --verify --quiet refs/heads/data; then
-            git checkout data
+          # Garante que temos o arquivo no workspace
+          test -f data/douclip.sqlite
+
+          # Cria ou atualiza o branch 'data'
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch origin data
+            git switch data
           else
-            git checkout --orphan data
-            git rm -rf . || true
+            git switch --orphan data
           fi
 
+          # Limpa tudo no branch 'data' (queremos só o banco)
+          git rm -rf . >/dev/null 2>&1 || true
+
           mkdir -p data
-          # o banco está no workspace original; pega dele via caminho absoluto
-          cp -f "$GITHUB_WORKSPACE/data/douclip.sqlite" data/douclip.sqlite
+
+          # Copia do workspace "main" para este branch sem risco de "same file"
+          # (usa um arquivo temporário)
+          cp "$GITHUB_WORKSPACE/data/douclip.sqlite" /tmp/douclip.sqlite
+          mv /tmp/douclip.sqlite data/douclip.sqlite
 
           git add data/douclip.sqlite
           git commit -m "Update douclip.sqlite" || echo "No DB changes to commit."
-          git push origin data
+          git push -u origin data
