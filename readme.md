@@ -101,7 +101,7 @@ No repositório → `Settings → Secrets and variables → Actions`:
 ```bash
 pip install -r requirements.txt
 python -m douclip run --config config.yml
-
+```
 
 ## Backfill histórico
 
@@ -123,3 +123,4 @@ O sistema é idempotente: pode rodar várias vezes sem duplicar dados.
 📄 Licença
 
 Uso interno / institucional.
+
