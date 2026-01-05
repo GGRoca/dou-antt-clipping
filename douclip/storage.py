@@ -3,6 +3,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Optional, Iterable, Tuple, List
 from datetime import datetime
+import os
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -140,3 +141,4 @@ class Storage:
             con.commit()
         finally:
             con.close()
+
