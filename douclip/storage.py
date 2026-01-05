@@ -1,9 +1,10 @@
 from __future__ import annotations
-import sqlite3
+
 import os
+import sqlite3
 from dataclasses import dataclass
-from typing import Optional, Iterable, Tuple, List
 from datetime import datetime
+from typing import Iterable, Optional
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS matches (
 );
 """
 
+
 @dataclass(frozen=True)
 class MatchRow:
     run_date: str
@@ -50,21 +52,19 @@ class MatchRow:
     text_full: str
     dou_link: Optional[str]
 
+
 class Storage:
     def __init__(self, sqlite_path: str):
-        # normaliza caminho e garante diretório
+        # Normaliza para caminho absoluto no runner e garante diretório
         self.sqlite_path = os.path.abspath(sqlite_path)
-
         db_dir = os.path.dirname(self.sqlite_path)
         os.makedirs(db_dir, exist_ok=True)
-
         self._init_db()
 
-   def _connect(self) -> sqlite3.Connection:
-        # garante de novo (defensivo)
+    def _connect(self) -> sqlite3.Connection:
+        # Defensivo: garante diretório de novo antes de conectar
         db_dir = os.path.dirname(self.sqlite_path)
         os.makedirs(db_dir, exist_ok=True)
-
         con = sqlite3.connect(self.sqlite_path)
         con.row_factory = sqlite3.Row
         return con
@@ -92,7 +92,10 @@ class Storage:
         con = self._connect()
         try:
             con.execute(
-                "INSERT OR IGNORE INTO processed_files(run_date, file_url, file_name, processed_ts) VALUES (?, ?, ?, ?)",
+                """
+                INSERT OR IGNORE INTO processed_files(run_date, file_url, file_name, processed_ts)
+                VALUES (?, ?, ?, ?)
+                """,
                 (run_date, file_url, file_name, datetime.utcnow().isoformat()),
             )
             con.commit()
@@ -103,11 +106,15 @@ class Storage:
         rows_list = list(rows)
         if not rows_list:
             return 0
+
         con = self._connect()
         try:
             con.executemany(
                 """
-                INSERT INTO matches(run_date, source_file_url, publication_title, orgao, keyword_hit, text_full, dou_link, created_ts)
+                INSERT INTO matches(
+                    run_date, source_file_url, publication_title, orgao,
+                    keyword_hit, text_full, dou_link, created_ts
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
@@ -129,7 +136,15 @@ class Storage:
         finally:
             con.close()
 
-    def log_run(self, run_date: str, files_seen: int, files_new: int, matches_found: int, email_sent: bool, notes: str = "") -> None:
+    def log_run(
+        self,
+        run_date: str,
+        files_seen: int,
+        files_new: int,
+        matches_found: int,
+        email_sent: bool,
+        notes: str = "",
+    ) -> None:
         con = self._connect()
         try:
             con.execute(
@@ -150,5 +165,3 @@ class Storage:
             con.commit()
         finally:
             con.close()
-
-
