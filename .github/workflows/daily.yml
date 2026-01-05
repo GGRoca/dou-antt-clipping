@@ -102,3 +102,8 @@ jobs:
           git add data/douclip.sqlite
           git commit -m "Update douclip.sqlite" || echo "No DB changes to commit."
           git push -u origin data
+
+          echo "✅ DB persisted to branch 'data'"
+          git rev-parse HEAD
+          ls -la data
+
