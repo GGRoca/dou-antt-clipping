@@ -1,9 +1,9 @@
 from __future__ import annotations
 import sqlite3
+import os
 from dataclasses import dataclass
 from typing import Optional, Iterable, Tuple, List
 from datetime import datetime
-import os
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -52,10 +52,19 @@ class MatchRow:
 
 class Storage:
     def __init__(self, sqlite_path: str):
-        self.sqlite_path = sqlite_path
+        # normaliza caminho e garante diretório
+        self.sqlite_path = os.path.abspath(sqlite_path)
+
+        db_dir = os.path.dirname(self.sqlite_path)
+        os.makedirs(db_dir, exist_ok=True)
+
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+   def _connect(self) -> sqlite3.Connection:
+        # garante de novo (defensivo)
+        db_dir = os.path.dirname(self.sqlite_path)
+        os.makedirs(db_dir, exist_ok=True)
+
         con = sqlite3.connect(self.sqlite_path)
         con.row_factory = sqlite3.Row
         return con
@@ -141,4 +150,5 @@ class Storage:
             con.commit()
         finally:
             con.close()
+
 
