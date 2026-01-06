@@ -8,6 +8,7 @@ Uso:
 from __future__ import annotations
 import argparse
 import sys
+import time
 from datetime import date, timedelta
 from dateutil.parser import isoparse
 
@@ -139,6 +140,7 @@ def main():
             print(f"✅ {matches} achado(s) para {d.isoformat()}")
         else:
             print(f"ℹ️  Nenhum achado para {d.isoformat()}")
+        time.sleep(2)
     
     print(f"\n{'='*60}")
     print(f"🎉 Backfill concluído!")
