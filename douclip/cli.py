@@ -4,7 +4,7 @@ import os
 from datetime import date, datetime, timedelta
 from dateutil.parser import isoparse
 
-from .config import load_config
+from .config import load_config, MailConfig
 from .inlabs import InlabsClient
 from .parser import parse_zip_for_text, parse_pdf_for_text, extract_publications_from_blob, find_relevant_hits
 from .storage import Storage, MatchRow
@@ -39,8 +39,20 @@ def build_email_html(run_date: str, matches: list[MatchRow]) -> str:
     </html>
     """
 
-def run_for_date(cfg_path: str, run_date: date) -> int:
+def run_for_date(cfg_path: str, run_date: date, no_email: bool = False) -> int:
     cfg = load_config(cfg_path)
+    
+    # Se --no-email foi passado, força desabilitar email
+    if no_email:
+        cfg = cfg._replace(mail=MailConfig(
+            enabled=False,
+            smtp_host=cfg.mail.smtp_host,
+            smtp_port=cfg.mail.smtp_port,
+            from_email=cfg.mail.from_email,
+            to_emails=cfg.mail.to_emails,
+            subject_prefix=cfg.mail.subject_prefix,
+        ))
+    
     storage = Storage(cfg.storage.sqlite_path)
     client = InlabsClient(cfg.inlabs.base_url)
 
@@ -136,19 +148,21 @@ def main():
 
     p_run = sub.add_parser("run")
     p_run.add_argument("--date", required=False, help="YYYY-MM-DD (default: hoje)")
+    p_run.add_argument("--no-email", action="store_true", help="Desabilita envio de email")
 
     p_back = sub.add_parser("backfill")
     p_back.add_argument("--start", required=True, help="YYYY-MM-DD")
     p_back.add_argument("--end", required=True, help="YYYY-MM-DD")
+    p_back.add_argument("--no-email", action="store_true", help="Desabilita envio de email")
 
     args = p.parse_args()
 
     if args.cmd == "run":
         d = date.today() if not args.date else isoparse(args.date).date()
-        run_for_date(args.config, d)
+        run_for_date(args.config, d, no_email=args.no_email)
 
     elif args.cmd == "backfill":
         d1 = isoparse(args.start).date()
         d2 = isoparse(args.end).date()
         for d in _daterange(d1, d2):
-            run_for_date(args.config, d)
+            run_for_date(args.config, d, no_email=args.no_email)
