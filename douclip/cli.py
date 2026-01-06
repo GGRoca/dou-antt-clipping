@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import os
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from dateutil.parser import isoparse
 
@@ -44,7 +45,7 @@ def run_for_date(cfg_path: str, run_date: date, no_email: bool = False) -> int:
     
     # Se --no-email foi passado, força desabilitar email
     if no_email:
-        cfg = cfg._replace(mail=MailConfig(
+        cfg = replace(cfg, mail=MailConfig(
             enabled=False,
             smtp_host=cfg.mail.smtp_host,
             smtp_port=cfg.mail.smtp_port,
