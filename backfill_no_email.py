@@ -11,6 +11,7 @@ import sys
 import time
 from datetime import date, timedelta
 from dateutil.parser import isoparse
+from dataclasses import replace
 
 from douclip.config import load_config, MailConfig
 from douclip.inlabs import InlabsClient
@@ -32,7 +33,7 @@ def run_for_date_no_email(cfg_path: str, run_date: date) -> int:
     cfg = load_config(cfg_path)
     
     # FORCE DISABLE EMAIL
-    cfg = cfg._replace(mail=MailConfig(
+    cfg = replace(cfg, mail=MailConfig(
         enabled=False,
         smtp_host=cfg.mail.smtp_host,
         smtp_port=cfg.mail.smtp_port,
