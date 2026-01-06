@@ -49,12 +49,13 @@ jobs:
             git fetch origin data
             git show origin/data:data/douclip.sqlite > data/douclip.sqlite || true
             if [ -f data/douclip.sqlite ]; then
-              echo "Restored DB from branch 'data'."
+              echo "✅ Restored DB from branch 'data'."
+              ls -lh data/douclip.sqlite
             else
-              echo "No DB file in branch 'data' yet."
+              echo "⚠️ No DB file in branch 'data' yet. First run will create it."
             fi
           else
-            echo "Branch 'data' does not exist yet."
+            echo "⚠️ Branch 'data' does not exist yet. First run will create it."
           fi
 
       # 2) Roda o clipping (atualiza/cria o banco)
@@ -67,7 +68,11 @@ jobs:
 
       - name: Verify DB exists
         run: |
-          test -f data/douclip.sqlite && echo "DB OK: data/douclip.sqlite" || (echo "DB missing!" && exit 1)
+          if [ ! -f data/douclip.sqlite ]; then
+            echo "❌ DB missing after run!"
+            exit 1
+          fi
+          echo "✅ DB OK: data/douclip.sqlite"
           ls -lh data/douclip.sqlite
 
       # 3) Comita o banco atualizado no branch "data"
@@ -79,7 +84,13 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Garante que temos o arquivo no workspace
-          test -f data/douclip.sqlite
+          if [ ! -f data/douclip.sqlite ]; then
+            echo "❌ Cannot commit: douclip.sqlite not found"
+            exit 1
+          fi
+
+          # Salva o arquivo em temp ANTES de trocar de branch
+          cp data/douclip.sqlite /tmp/douclip.sqlite
 
           # Cria ou atualiza o branch 'data'
           if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
@@ -94,16 +105,13 @@ jobs:
 
           mkdir -p data
 
-          # Copia do workspace "main" para este branch sem risco de "same file"
-          # (usa um arquivo temporário)
-          cp "$GITHUB_WORKSPACE/data/douclip.sqlite" /tmp/douclip.sqlite
+          # Move do temp para o branch data
           mv /tmp/douclip.sqlite data/douclip.sqlite
 
           git add data/douclip.sqlite
-          git commit -m "Update douclip.sqlite" || echo "No DB changes to commit."
+          git commit -m "Update douclip.sqlite [$(date -u +%Y-%m-%dT%H:%M:%SZ)]" || echo "No DB changes to commit."
           git push -u origin data
 
           echo "✅ DB persisted to branch 'data'"
           git rev-parse HEAD
           ls -la data
-
