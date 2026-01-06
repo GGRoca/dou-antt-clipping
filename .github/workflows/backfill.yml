@@ -1,0 +1,33 @@
+name: Backfill Histórico (Sem Email)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Data inicial (YYYY-MM-DD)'
+        required: true
+        default: '2023-01-01'
+      end_date:
+        description: 'Data final (YYYY-MM-DD)'
+        required: true
+        default: '2023-12-31'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run backfill (NO EMAIL)
+        run: |
+          python backfill_no_email.py --start ${{ github.event.inputs.start_date }} --end ${{ github.event.inputs.end_date }}
