@@ -1,152 +1,33 @@
+name: Backfill Histórico (Sem Email)
 
-"""
-Script para backfill histórico sem envio de emails.
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Data inicial (YYYY-MM-DD)'
+        required: true
+        default: '2024-01-01'
+      end_date:
+        description: 'Data final (YYYY-MM-DD)'
+        required: true
+        default: '2024-12-31'
 
-Uso:
-    python backfill_no_email.py --start 2023-01-01 --end 2024-12-31
-"""
-from __future__ import annotations
-import argparse
-import sys
-from dataclasses import replace
-from datetime import date, timedelta
-from dateutil.parser import isoparse
-
-from douclip.config import load_config, MailConfig
-from douclip.inlabs import InlabsClient
-from douclip.parser import parse_zip_for_text, parse_pdf_for_text, extract_publications_from_blob, find_relevant_hits
-from douclip.storage import Storage, MatchRow
-
-
-def _daterange(d1: date, d2: date):
-    cur = d1
-    while cur <= d2:
-        yield cur
-        cur += timedelta(days=1)
-
-
-def run_for_date_no_email(cfg_path: str, run_date: date) -> int:
-    """
-    Versão do run_for_date que NUNCA envia email.
-    """
-    cfg = load_config(cfg_path)
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
     
-    # FORCE DISABLE EMAIL usando dataclasses.replace
-    cfg = replace(cfg, mail=MailConfig(
-        enabled=False,
-        smtp_host=cfg.mail.smtp_host,
-        smtp_port=cfg.mail.smtp_port,
-        from_email=cfg.mail.from_email,
-        to_emails=cfg.mail.to_emails,
-        subject_prefix=cfg.mail.subject_prefix,
-    ))
-    
-    storage = Storage(cfg.storage.sqlite_path)
-    client = InlabsClient(cfg.inlabs.base_url)
-
-    files = client.list_files(run_date)
-    files_seen = len(files)
-
-    new_files = [f for f in files if not storage.was_file_processed(f.url)]
-    files_new = len(new_files)
-
-    all_match_rows: list[MatchRow] = []
-
-    for f in new_files:
-        name_lower = f.name.lower()
-        try:
-            data = client.download_bytes(f.url)
-            if name_lower.endswith(".zip"):
-                blob = parse_zip_for_text(data)
-            elif name_lower.endswith(".pdf"):
-                blob = parse_pdf_for_text(data)
-            else:
-                # xml direto
-                blob = data.decode("utf-8", errors="ignore")
-
-            pubs = extract_publications_from_blob(blob)
-            hits = find_relevant_hits(pubs, cfg.filters.orgao_contains, cfg.filters.keywords_any)
-
-            for pub, kw in hits:
-                all_match_rows.append(
-                    MatchRow(
-                        run_date=run_date.isoformat(),
-                        source_file_url=f.url,
-                        publication_title=pub.title,
-                        orgao=pub.orgao,
-                        keyword_hit=kw,
-                        text_full=pub.full_text,
-                        dou_link=pub.dou_link,
-                    )
-                )
-
-            storage.mark_file_processed(run_date.isoformat(), f.url, f.name)
-            print(f"✅ Processado: {f.name}")
-            
-        except Exception as e:
-            print(f"❌ Erro processando {f.url}: {repr(e)}", file=sys.stderr)
-            storage.log_run(
-                run_date=run_date.isoformat(),
-                files_seen=files_seen,
-                files_new=files_new,
-                matches_found=0,
-                email_sent=False,
-                notes=f"Erro processando {f.url}: {repr(e)}",
-            )
-            continue
-
-    matches_found = storage.insert_matches(all_match_rows)
-
-    # EMAIL SEMPRE DESABILITADO NO BACKFILL
-    storage.log_run(
-        run_date=run_date.isoformat(),
-        files_seen=files_seen,
-        files_new=files_new,
-        matches_found=matches_found,
-        email_sent=False,  # NUNCA envia
-        notes=f"Backfill - {matches_found} achado(s)",
-    )
-
-    return matches_found
-
-
-def main():
-    p = argparse.ArgumentParser(description="Backfill histórico sem envio de emails")
-    p.add_argument("--config", default="config.yml", help="Caminho do config.yml")
-    p.add_argument("--start", required=True, help="Data inicial (YYYY-MM-DD)")
-    p.add_argument("--end", required=True, help="Data final (YYYY-MM-DD)")
-    
-    args = p.parse_args()
-
-    d1 = isoparse(args.start).date()
-    d2 = isoparse(args.end).date()
-    
-    print(f"🔄 Iniciando backfill de {d1} até {d2}")
-    print(f"📧 E-mail: DESABILITADO para backfill\n")
-    
-    total_matches = 0
-    total_days = 0
-    
-    for d in _daterange(d1, d2):
-        total_days += 1
-        print(f"\n{'='*60}")
-        print(f"📅 Processando: {d.isoformat()}")
-        print(f"{'='*60}")
-        
-        matches = run_for_date_no_email(args.config, d)
-        total_matches += matches
-        
-        if matches > 0:
-            print(f"✅ {matches} achado(s) para {d.isoformat()}")
-        else:
-            print(f"ℹ️  Nenhum achado para {d.isoformat()}")
-    
-    print(f"\n{'='*60}")
-    print(f"🎉 Backfill concluído!")
-    print(f"📊 Dias processados: {total_days}")
-    print(f"📊 Total de achados: {total_matches}")
-    print(f"{'='*60}")
-
-
-if __name__ == "__main__":
-    main()
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run backfill (NO EMAIL)
+        run: |
+          python backfill_no_email.py --start ${{ github.event.inputs.start_date }} --end ${{ github.event.inputs.end_date }}
