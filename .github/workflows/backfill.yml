@@ -64,9 +64,12 @@ jobs:
           
           cp data/clipping.sqlite /tmp/clipping.sqlite
           
+          # Limpa referências locais
+          git branch -D data 2>/dev/null || true
+          
           if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
-            git fetch origin data
-            git checkout data
+            git fetch origin data:refs/remotes/origin/data
+            git checkout -b data origin/data
           else
             git checkout --orphan data
             git rm -rf . >/dev/null 2>&1 || true
