@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-Clipping DOU - ANTT/SUFER via INLABS
-
-Sistema automatizado para monitorar publicações do Diário Oficial da União
-relacionadas à ANTT (Agência Nacional de Transportes Terrestres) e SUFER
-(Superintendência de Transporte Ferroviário).
+Clipping DOU - ANTT/SUFER via INLABS (Versão Final)
 
 Características:
-- Login autenticado no INLABS
-- Busca apenas seção 1 (DO1)
-- Filtros: órgão + palavras-chave
-- E-mail apenas quando há achados
-- SQLite para deduplicação e histórico
-- Suporte a backfill (sem envio de e-mail)
+- Janela de busca: D-2, D-1, D+0 (3 dias)
+- E-mail inteligente: sempre seg-sex 10:08, outros horários só com achados
+- ZIP preferencial + PDF fallback
+- Arquitetura extensível (multi-filtro)
+- Deduplicação automática
 """
 import argparse
 import os
@@ -22,7 +17,7 @@ import smtplib
 import zipfile
 from io import BytesIO
 from datetime import date, datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -31,18 +26,31 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    PdfReader = None
+
 
 # ============================================================================
 # CONFIGURAÇÃO
 # ============================================================================
 
 @dataclass
+class FilterConfig:
+    """Configuração de um filtro de busca"""
+    nome: str
+    secao: str  # DO1, DO2, DO3
+    orgao: str
+    keywords: List[str]
+
+
+@dataclass
 class Config:
     """Configuração do sistema"""
     inlabs_email: str
     inlabs_password: str
-    filter_orgao: str
-    filter_keywords: List[str]
+    filtros: List[FilterConfig]
     smtp_host: str
     smtp_port: int
     smtp_user: str
@@ -51,6 +59,7 @@ class Config:
     email_to: List[str]
     email_subject_prefix: str
     db_path: str
+    lookback_days: int  # Janela de revarredura (padrão: 2 = D-2, D-1, D+0)
 
 
 def load_config(config_path: str) -> Config:
@@ -64,11 +73,20 @@ def load_config(config_path: str) -> Config:
     smtp_user = os.getenv('SMTP_USER', cfg['mail']['smtp_user'])
     smtp_pass = os.getenv('SMTP_PASS', cfg['mail']['smtp_pass'])
     
+    # Carrega filtros (suporta múltiplos)
+    filtros = []
+    for f in cfg['filtros']:
+        filtros.append(FilterConfig(
+            nome=f['nome'],
+            secao=f['secao'],
+            orgao=f['orgao'],
+            keywords=f['keywords']
+        ))
+    
     return Config(
         inlabs_email=inlabs_email,
         inlabs_password=inlabs_password,
-        filter_orgao=cfg['filters']['orgao_contains'],
-        filter_keywords=cfg['filters']['keywords_any'],
+        filtros=filtros,
         smtp_host=cfg['mail']['smtp_host'],
         smtp_port=cfg['mail']['smtp_port'],
         smtp_user=smtp_user,
@@ -77,6 +95,7 @@ def load_config(config_path: str) -> Config:
         email_to=cfg['mail']['to_emails'],
         email_subject_prefix=cfg['mail']['subject_prefix'],
         db_path=cfg['storage']['db_path'],
+        lookback_days=cfg.get('lookback_days', 2),  # Padrão: 2 dias (D-2, D-1, D+0)
     )
 
 
@@ -109,6 +128,7 @@ def init_db(db_path: str):
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_date TEXT NOT NULL,
+            filter_name TEXT NOT NULL,
             source_file TEXT NOT NULL,
             keyword_hit TEXT NOT NULL,
             text_snippet TEXT NOT NULL,
@@ -141,15 +161,15 @@ def mark_file_processed(db_path: str, filename: str, run_date: str):
     con.close()
 
 
-def insert_matches(db_path: str, matches: List[Tuple[str, str, str, str]]) -> int:
+def insert_matches(db_path: str, matches: List[Tuple[str, str, str, str, str]]) -> int:
     """Insere matches no banco. Retorna quantidade inserida."""
     if not matches:
         return 0
     
     con = sqlite3.connect(db_path)
     con.executemany(
-        "INSERT INTO matches (run_date, source_file, keyword_hit, text_snippet, created_ts) VALUES (?, ?, ?, ?, ?)",
-        [(m[0], m[1], m[2], m[3], datetime.utcnow().isoformat()) for m in matches]
+        "INSERT INTO matches (run_date, filter_name, source_file, keyword_hit, text_snippet, created_ts) VALUES (?, ?, ?, ?, ?, ?)",
+        [(m[0], m[1], m[2], m[3], m[4], datetime.utcnow().isoformat()) for m in matches]
     )
     con.commit()
     count = len(matches)
@@ -192,22 +212,47 @@ class InlabsClient:
         if r.status_code != 200 or "sair" not in r.text.lower():
             raise RuntimeError("Falha no login do INLABS. Verifique credenciais.")
     
-    def list_files(self, target_date: date) -> List[str]:
-        """Lista arquivos disponíveis para uma data (apenas DO1 e DO1E)"""
+    def list_files(self, target_date: date, secao: str) -> List[str]:
+        """
+        Lista arquivos disponíveis para uma data e seção.
+        
+        Args:
+            target_date: Data alvo
+            secao: "DO1", "DO2" ou "DO3"
+        
+        Returns:
+            Lista de nomes de arquivo (ZIPs e PDFs)
+        """
         date_str = target_date.isoformat()
+        date_str_underscore = date_str.replace("-", "_")
         url = f"https://inlabs.in.gov.br/index.php?p={date_str}"
         
         r = self.session.get(url, timeout=30)
-        
-        # Extrai nomes de arquivo do HTML
         text = r.text
-        files = []
         
-        # Apenas DO1 (seção 1) e DO1E (extras da seção 1)
-        for pattern in [r'(\d{4}-\d{2}-\d{2}-DO1\.zip)', r'(\d{4}-\d{2}-\d{2}-DO1E\.zip)']:
+        files = []
+        secao_num = secao.replace("DO", "")  # "DO1" -> "1"
+        
+        # ZIPs (normal + extras)
+        zip_patterns = [
+            rf'(\d{{4}}-\d{{2}}-\d{{2}}-DO{secao_num}\.zip)',
+            rf'(\d{{4}}-\d{{2}}-\d{{2}}-DO{secao_num}E\.zip)',
+        ]
+        
+        for pattern in zip_patterns:
             files.extend(re.findall(pattern, text))
         
-        return list(set(files))  # Remove duplicatas
+        # PDFs (normal + extras A, B, C)
+        pdf_patterns = [
+            rf'(\d{{4}}_\d{{2}}_\d{{2}}_ASSINADO_do{secao_num}\.pdf)',
+            rf'(\d{{4}}_\d{{2}}_\d{{2}}_ASSINADO_do{secao_num}_extra_[ABC]\.pdf)',
+        ]
+        
+        for pattern in pdf_patterns:
+            files.extend(re.findall(pattern, text))
+        
+        # Remove duplicatas
+        return list(set(files))
     
     def download_file(self, target_date: date, filename: str) -> bytes:
         """Baixa arquivo do INLABS"""
@@ -250,20 +295,36 @@ def extract_text_from_zip(zip_bytes: bytes) -> str:
     return '\n\n'.join(texts)
 
 
-def find_matches(text: str, orgao_filter: str, keywords: List[str]) -> List[Tuple[str, str]]:
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extrai texto de PDF"""
+    if not PdfReader:
+        raise RuntimeError("PyPDF2 não instalado. Instale com: pip install PyPDF2")
+    
+    reader = PdfReader(BytesIO(pdf_bytes))
+    texts = []
+    
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            texts.append(text.strip())
+    
+    return '\n\n'.join(texts)
+
+
+def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str]]:
     """
-    Busca matches no texto.
+    Busca matches no texto baseado em um filtro.
     Retorna lista de (keyword_matched, text_snippet).
     """
     matches = []
     text_lower = text.lower()
     
     # Filtro por órgão
-    if orgao_filter.lower() not in text_lower:
+    if filter_config.orgao.lower() not in text_lower:
         return matches
     
     # Busca por palavras-chave
-    for keyword in keywords:
+    for keyword in filter_config.keywords:
         if keyword.lower() in text_lower:
             # Extrai snippet ao redor da palavra-chave (500 chars)
             idx = text_lower.find(keyword.lower())
@@ -280,50 +341,97 @@ def find_matches(text: str, orgao_filter: str, keywords: List[str]) -> List[Tupl
 # E-MAIL
 # ============================================================================
 
-def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str, str]]):
-    """Envia e-mail com os achados"""
-    if not matches:
-        return
+def should_always_send_email() -> bool:
+    """
+    Verifica se deve sempre enviar e-mail (mesmo sem achados).
+    Retorna True se for segunda a sexta entre 09:00 e 11:00 UTC (06:00-08:00 BRT -> 10:08 BRT).
+    """
+    now = datetime.utcnow()
+    
+    # Segunda (0) a Sexta (4)
+    is_weekday = now.weekday() < 5
+    
+    # Entre 09:00 e 11:00 UTC (aproximação do horário 10:08 BRT)
+    is_morning_run = 9 <= now.hour < 11
+    
+    return is_weekday and is_morning_run
+
+
+def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str, str, str]], force_send: bool = False):
+    """
+    Envia e-mail com os achados.
+    
+    Args:
+        force_send: Se True, envia mesmo sem achados (para confirmação diária)
+    """
+    # Se não deve forçar envio e não há matches, não envia
+    if not force_send and not matches:
+        return False
     
     # Monta HTML
-    items_html = []
-    for i, (_, source_file, keyword, snippet) in enumerate(matches, 1):
-        items_html.append(f"""
-            <hr/>
-            <h3>Achado #{i} — Palavra-chave: <code>{keyword}</code></h3>
-            <p><b>Arquivo fonte:</b> {source_file}</p>
-            <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 5px;">
+    if matches:
+        items_html = []
+        for i, (_, filter_name, source_file, keyword, snippet) in enumerate(matches, 1):
+            items_html.append(f"""
+                <hr/>
+                <h3>Achado #{i} — Filtro: {filter_name}</h3>
+                <p><b>Palavra-chave:</b> <code>{keyword}</code></p>
+                <p><b>Arquivo fonte:</b> {source_file}</p>
+                <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 5px; border-left: 3px solid #007bff;">
 {snippet}
-            </pre>
-        """)
-    
-    html_body = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif;">
-        <h2>{config.email_subject_prefix} {run_date}</h2>
-        <p><b>Total de achados: {len(matches)}</b></p>
-        {''.join(items_html)}
-        <hr/>
-        <p style="color: #666; font-size: 12px;">
-            Clipping automático gerado via INLABS<br/>
-            ANTT/SUFER - Seção 1 do DOU
-        </p>
-    </body>
-    </html>
-    """
+                </pre>
+            """)
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <h2 style="color: #28a745;">{config.email_subject_prefix} {run_date}</h2>
+            <p><b>✅ Total de achados: {len(matches)}</b></p>
+            {''.join(items_html)}
+            <hr/>
+            <p style="color: #666; font-size: 12px;">
+                Clipping automático gerado via INLABS<br/>
+                Janela de busca: D-2, D-1, D+0 | Seções: {', '.join(set(f.secao for f in config.filtros))}
+            </p>
+        </body>
+        </html>
+        """
+        subject = f"{config.email_subject_prefix} {run_date} — {len(matches)} achado(s)"
+    else:
+        # E-mail de confirmação (sem achados)
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <h2 style="color: #6c757d;">{config.email_subject_prefix} {run_date}</h2>
+            <p><b>✓ Sistema operacional</b></p>
+            <p>Nenhuma publicação encontrada com os critérios de busca.</p>
+            <hr/>
+            <p style="color: #666; font-size: 12px;">
+                Este é um e-mail de confirmação diária (segunda a sexta, 10:08 BRT).<br/>
+                O sistema continua monitorando o DOU automaticamente.
+            </p>
+        </body>
+        </html>
+        """
+        subject = f"{config.email_subject_prefix} {run_date} — Sistema operacional (0 achados)"
     
     # Monta mensagem
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"{config.email_subject_prefix} {run_date} — {len(matches)} achado(s)"
+    msg['Subject'] = subject
     msg['From'] = config.email_from
     msg['To'] = ', '.join(config.email_to)
     msg.attach(MIMEText(html_body, 'html', 'utf-8'))
     
     # Envia
-    with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=60) as server:
-        server.starttls()
-        server.login(config.smtp_user, config.smtp_pass)
-        server.sendmail(config.email_from, config.email_to, msg.as_string())
+    try:
+        with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=60) as server:
+            server.starttls()
+            server.login(config.smtp_user, config.smtp_pass)
+            server.sendmail(config.email_from, config.email_to, msg.as_string())
+        return True
+    except Exception as e:
+        print(f"Erro enviando e-mail: {e}")
+        return False
 
 
 # ============================================================================
@@ -332,60 +440,74 @@ def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str,
 
 def run_for_date(config: Config, target_date: date, send_email_flag: bool = True) -> int:
     """
-    Executa clipping para uma data específica.
+    Executa clipping para uma data específica com janela de lookback.
     Retorna número de matches encontrados.
     """
     init_db(config.db_path)
     
     client = InlabsClient(config.inlabs_email, config.inlabs_password)
     
-    # Lista arquivos
-    files = client.list_files(target_date)
-    new_files = [f for f in files if not was_file_processed(config.db_path, f)]
+    # Janela de busca: D-lookback até D+0
+    dates_to_check = [target_date - timedelta(days=i) for i in range(config.lookback_days, -1, -1)]
     
     all_matches = []
     files_processed = 0
     
-    # Processa cada arquivo
-    for filename in new_files:
-        try:
-            # Download
-            content = client.download_file(target_date, filename)
-            
-            # Parse
-            text = extract_text_from_zip(content)
-            
-            # Busca matches
-            matches = find_matches(text, config.filter_orgao, config.filter_keywords)
-            
-            # Salva matches
-            for keyword, snippet in matches:
-                all_matches.append((
-                    target_date.isoformat(),
-                    filename,
-                    keyword,
-                    snippet
-                ))
-            
-            # Marca como processado
-            mark_file_processed(config.db_path, filename, target_date.isoformat())
-            files_processed += 1
+    # Para cada filtro configurado
+    for filter_cfg in config.filtros:
+        print(f"  Filtro: {filter_cfg.nome} (Seção {filter_cfg.secao})")
         
-        except Exception as e:
-            print(f"Erro processando {filename}: {e}")
-            continue
+        # Para cada data na janela
+        for check_date in dates_to_check:
+            # Lista arquivos
+            files = client.list_files(check_date, filter_cfg.secao)
+            new_files = [f for f in files if not was_file_processed(config.db_path, f)]
+            
+            # Processa cada arquivo
+            for filename in new_files:
+                try:
+                    # Download
+                    content = client.download_file(check_date, filename)
+                    
+                    # Parse (ZIP ou PDF)
+                    if filename.endswith('.zip'):
+                        text = extract_text_from_zip(content)
+                    elif filename.endswith('.pdf'):
+                        text = extract_text_from_pdf(content)
+                    else:
+                        continue
+                    
+                    # Busca matches
+                    matches = find_matches(text, filter_cfg)
+                    
+                    # Salva matches
+                    for keyword, snippet in matches:
+                        all_matches.append((
+                            check_date.isoformat(),
+                            filter_cfg.nome,
+                            filename,
+                            keyword,
+                            snippet
+                        ))
+                    
+                    # Marca como processado
+                    mark_file_processed(config.db_path, filename, check_date.isoformat())
+                    files_processed += 1
+                
+                except Exception as e:
+                    print(f"    Erro processando {filename}: {e}")
+                    continue
     
     # Insere matches no banco
     matches_count = insert_matches(config.db_path, all_matches)
     
-    # Envia e-mail (se habilitado e houver achados)
+    # Decide se envia e-mail
+    force_send = should_always_send_email()
     email_sent = False
-    if send_email_flag and matches_count > 0:
-        try:
-            send_email(config, target_date.isoformat(), all_matches)
-            email_sent = True
-        except Exception as e:
-            print(f"Erro enviando e-mail: {e}")
+    
+    if send_email_flag:
+        if matches_count > 0 or force_send:
+            email_sent = send_email(config, target_date.isoformat(), all_matches, force_send)
     
     # Log da execução
     log_run(
@@ -394,7 +516,7 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
         files_processed,
         matches_count,
         email_sent,
-        notes=f"OK - {len(files)} arquivo(s) disponível(is), {files_processed} novo(s)"
+        notes=f"Lookback: {config.lookback_days} dias, {files_processed} arquivo(s) processado(s)"
     )
     
     return matches_count
@@ -405,7 +527,7 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Clipping DOU - ANTT/SUFER')
+    parser = argparse.ArgumentParser(description='Clipping DOU - Multi-filtro')
     parser.add_argument('--config', default='config.yml', help='Caminho do arquivo de configuração')
     
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -430,6 +552,7 @@ def main():
         send_email = not args.no_email
         
         print(f"Executando clipping para {target_date.isoformat()}...")
+        print(f"Janela: {config.lookback_days} dias (D-{config.lookback_days} até D+0)")
         matches = run_for_date(config, target_date, send_email)
         print(f"✓ Concluído: {matches} achado(s)")
     

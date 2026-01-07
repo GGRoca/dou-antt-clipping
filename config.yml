@@ -1,30 +1,70 @@
-# Configuração do Clipping DOU - ANTT/SUFER
+# Configuração do Clipping DOU - Arquitetura Multi-Filtro
 
 inlabs:
-  # Credenciais do INLABS (pode usar variáveis de ambiente)
-  email: "seu-email@example.com"
-  password: "sua-senha"
+  # Credenciais do INLABS (podem vir de variáveis de ambiente)
+  email: ""  # ou deixe vazio para usar INLABS_EMAIL
+  password: ""  # ou deixe vazio para usar INLABS_PASSWORD
 
-filters:
-  # Filtro por órgão (deve aparecer no texto)
-  orgao_contains: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+# Janela de revarredura (lookback)
+# 2 = busca D-2, D-1, D+0 (últimos 3 dias)
+lookback_days: 2
+
+# ============================================================================
+# FILTROS: Você pode adicionar quantos quiser!
+# ============================================================================
+filtros:
+  # Filtro 1: ANTT/SUFER - Autorizações Ferroviárias
+  - nome: "ANTT-SUFER-Autorizacoes"
+    secao: "DO1"  # DO1, DO2 ou DO3
+    orgao: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+    keywords:
+      - "outorga por autorização ferroviária"
+      - "autorização"
+
+  # ========================================================================
+  # EXEMPLOS DE COMO ADICIONAR MAIS FILTROS (descomente para ativar):
+  # ========================================================================
   
-  # Palavras-chave (qualquer uma delas)
-  keywords_any:
-    - "outorga por autorização ferroviária"
-    - "autorização"
+  # Filtro 2: ANTT/SUFER - Regulação
+  # - nome: "ANTT-SUFER-Regulacao"
+  #   secao: "DO1"
+  #   orgao: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+  #   keywords:
+  #     - "regulação"
+  #     - "norma"
+  #     - "resolução"
+  
+  # Filtro 3: Ministro dos Transportes
+  # - nome: "MinTransportes-Ministro-Renan"
+  #   secao: "DO1"
+  #   orgao: "Ministério dos Transportes"
+  #   keywords:
+  #     - "Renan Filho"
+  #     - "Ministro de Estado"
+  
+  # Filtro 4: ANTT - Seção 3 (contratos)
+  # - nome: "ANTT-Contratos"
+  #   secao: "DO3"
+  #   orgao: "Agência Nacional de Transportes Terrestres"
+  #   keywords:
+  #     - "contrato"
+  #     - "licitação"
 
+# ============================================================================
+# E-MAIL
+# ============================================================================
 mail:
-  # Configurações de e-mail
   smtp_host: "smtp.gmail.com"
   smtp_port: 587
-  smtp_user: ""  # Pode vir de variável de ambiente SMTP_USER
-  smtp_pass: ""  # Pode vir de variável de ambiente SMTP_PASS
+  smtp_user: ""  # ou deixe vazio para usar SMTP_USER
+  smtp_pass: ""  # ou deixe vazio para usar SMTP_PASS
   from_email: "guilherme.artintel@gmail.com"
   to_emails:
     - "guiroca@gmail.com"
   subject_prefix: "[DOU][ANTT][SUFER]"
 
+# ============================================================================
+# ARMAZENAMENTO
+# ============================================================================
 storage:
-  # Caminho do banco SQLite
   db_path: "data/clipping.sqlite"
