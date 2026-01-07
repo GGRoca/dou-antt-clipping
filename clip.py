@@ -438,17 +438,29 @@ def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str,
 # EXECUÇÃO PRINCIPAL
 # ============================================================================
 
-def run_for_date(config: Config, target_date: date, send_email_flag: bool = True) -> int:
+def run_for_date(config: Config, target_date: date, send_email_flag: bool = True, use_lookback: bool = True) -> int:
     """
-    Executa clipping para uma data específica com janela de lookback.
+    Executa clipping para uma data específica com janela de lookback opcional.
+    
+    Args:
+        config: Configuração do sistema
+        target_date: Data alvo
+        send_email_flag: Se deve enviar e-mail
+        use_lookback: Se deve usar janela D-2, D-1, D+0 (True) ou apenas D+0 (False)
+    
     Retorna número de matches encontrados.
     """
     init_db(config.db_path)
     
     client = InlabsClient(config.inlabs_email, config.inlabs_password)
     
-    # Janela de busca: D-lookback até D+0
-    dates_to_check = [target_date - timedelta(days=i) for i in range(config.lookback_days, -1, -1)]
+    # Janela de busca: com ou sem lookback
+    if use_lookback:
+        # Diário: D-lookback até D+0 (captura extras tardias)
+        dates_to_check = [target_date - timedelta(days=i) for i in range(config.lookback_days, -1, -1)]
+    else:
+        # Backfill: apenas D+0 (dados históricos já estão completos)
+        dates_to_check = [target_date]
     
     all_matches = []
     files_processed = 0
@@ -510,13 +522,14 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
             email_sent = send_email(config, target_date.isoformat(), all_matches, force_send)
     
     # Log da execução
+    lookback_note = f"Lookback: {config.lookback_days} dias" if use_lookback else "Sem lookback (backfill)"
     log_run(
         config.db_path,
         target_date.isoformat(),
         files_processed,
         matches_count,
         email_sent,
-        notes=f"Lookback: {config.lookback_days} dias, {files_processed} arquivo(s) processado(s)"
+        notes=f"{lookback_note}, {files_processed} arquivo(s) processado(s)"
     )
     
     return matches_count
@@ -553,7 +566,7 @@ def main():
         
         print(f"Executando clipping para {target_date.isoformat()}...")
         print(f"Janela: {config.lookback_days} dias (D-{config.lookback_days} até D+0)")
-        matches = run_for_date(config, target_date, send_email)
+        matches = run_for_date(config, target_date, send_email, use_lookback=True)
         print(f"✓ Concluído: {matches} achado(s)")
     
     elif args.command == 'backfill':
@@ -561,14 +574,14 @@ def main():
         end_date = date.fromisoformat(args.end)
         
         print(f"Backfill de {start_date} até {end_date}")
-        print("(E-mails desabilitados durante backfill)\n")
+        print("(E-mails desabilitados, sem lookback - apenas D+0 por dia)\n")
         
         current = start_date
         total_matches = 0
         
         while current <= end_date:
             print(f"Processando {current.isoformat()}...", end=' ')
-            matches = run_for_date(config, current, send_email_flag=False)
+            matches = run_for_date(config, current, send_email_flag=False, use_lookback=False)
             total_matches += matches
             print(f"{matches} achado(s)")
             
