@@ -1,1 +1,30 @@
+# Database
 data/*.sqlite
+data/*.sqlite-*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug/test files
+debug_*
+test_*
+downloaded_*
+*.log

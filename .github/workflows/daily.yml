@@ -1,7 +1,8 @@
-name: DOU ANTT Clipping
+name: Clipping Diário
 
 on:
   schedule:
+    # 6 execuções por dia (horários BRT)
     - cron: "8 10 * * *"   # 07:08 BRT
     - cron: "8 13 * * *"   # 10:08 BRT
     - cron: "8 16 * * *"   # 13:08 BRT
@@ -17,14 +18,13 @@ jobs:
   run:
     runs-on: ubuntu-latest
     concurrency:
-      group: douclip-db
+      group: clipping-db
       cancel-in-progress: false
 
     steps:
-      - name: Checkout main (code)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
 
       - name: Setup Python
@@ -32,86 +32,58 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 1) Puxa o banco do branch "data" (se existir)
-      - name: Fetch DB branch (data)
-        run: |
-          git fetch origin data:data || true
-
-      - name: Restore SQLite from branch 'data' (if exists)
+      - name: Restore database from branch 'data'
         run: |
           mkdir -p data
           if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
             git fetch origin data
-            git show origin/data:data/douclip.sqlite > data/douclip.sqlite || true
-            if [ -f data/douclip.sqlite ]; then
-              echo "✅ Restored DB from branch 'data'."
-              ls -lh data/douclip.sqlite
-            else
-              echo "⚠️ No DB file in branch 'data' yet. First run will create it."
+            git show origin/data:data/clipping.sqlite > data/clipping.sqlite 2>/dev/null || echo "No DB yet"
+            if [ -f data/clipping.sqlite ]; then
+              echo "✓ Database restored"
+              ls -lh data/clipping.sqlite
             fi
-          else
-            echo "⚠️ Branch 'data' does not exist yet. First run will create it."
           fi
 
-      # 2) Roda o clipping (atualiza/cria o banco)
       - name: Run clipping
         env:
+          INLABS_EMAIL: ${{ secrets.INLABS_EMAIL }}
+          INLABS_PASSWORD: ${{ secrets.INLABS_PASSWORD }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
-          python -m douclip --config config.yml run
+          python clip.py --config config.yml run
 
-      - name: Verify DB exists
+      - name: Persist database to branch 'data'
         run: |
-          if [ ! -f data/douclip.sqlite ]; then
-            echo "❌ DB missing after run!"
+          if [ ! -f data/clipping.sqlite ]; then
+            echo "✗ Database not found!"
             exit 1
           fi
-          echo "✅ DB OK: data/douclip.sqlite"
-          ls -lh data/douclip.sqlite
-
-      # 3) Comita o banco atualizado no branch "data"
-      - name: Commit DB to branch 'data'
-        run: |
-          set -e
-
+          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Garante que temos o arquivo no workspace
-          if [ ! -f data/douclip.sqlite ]; then
-            echo "❌ Cannot commit: douclip.sqlite not found"
-            exit 1
-          fi
-
-          # Salva o arquivo em temp ANTES de trocar de branch
-          cp data/douclip.sqlite /tmp/douclip.sqlite
-
-          # Cria ou atualiza o branch 'data'
+          
+          # Salva DB temporariamente
+          cp data/clipping.sqlite /tmp/clipping.sqlite
+          
+          # Checkout/cria branch data
           if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
             git fetch origin data
-            git switch data
+            git checkout data
           else
-            git switch --orphan data
+            git checkout --orphan data
+            git rm -rf . >/dev/null 2>&1 || true
           fi
-
-          # Limpa tudo no branch 'data' (queremos só o banco)
-          git rm -rf . >/dev/null 2>&1 || true
-
+          
           mkdir -p data
-
-          # Move do temp para o branch data
-          mv /tmp/douclip.sqlite data/douclip.sqlite
-
-          git add data/douclip.sqlite
-          git commit -m "Update douclip.sqlite [$(date -u +%Y-%m-%dT%H:%M:%SZ)]" || echo "No DB changes to commit."
+          mv /tmp/clipping.sqlite data/clipping.sqlite
+          
+          git add data/clipping.sqlite
+          git commit -m "Update database [$(date -u +%Y-%m-%dT%H:%M:%SZ)]" || echo "No changes"
           git push -u origin data
-
-          echo "✅ DB persisted to branch 'data'"
-          git rev-parse HEAD
-          ls -la data
+          
+          echo "✓ Database persisted"

@@ -1,20 +1,30 @@
+# Configuração do Clipping DOU - ANTT/SUFER
+
 inlabs:
-  base_url: "https://inlabs.in.gov.br"
+  # Credenciais do INLABS (pode usar variáveis de ambiente)
+  email: "seu-email@example.com"
+  password: "sua-senha"
 
 filters:
+  # Filtro por órgão (deve aparecer no texto)
   orgao_contains: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+  
+  # Palavras-chave (qualquer uma delas)
   keywords_any:
     - "outorga por autorização ferroviária"
     - "autorização"
 
 mail:
-  enabled: true
+  # Configurações de e-mail
   smtp_host: "smtp.gmail.com"
   smtp_port: 587
+  smtp_user: ""  # Pode vir de variável de ambiente SMTP_USER
+  smtp_pass: ""  # Pode vir de variável de ambiente SMTP_PASS
   from_email: "guilherme.artintel@gmail.com"
   to_emails:
     - "guiroca@gmail.com"
   subject_prefix: "[DOU][ANTT][SUFER]"
 
 storage:
-  sqlite_path: "data/douclip.sqlite"
+  # Caminho do banco SQLite
+  db_path: "data/clipping.sqlite"
