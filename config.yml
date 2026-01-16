@@ -13,12 +13,12 @@ lookback_days: 2
 # FILTROS: Você pode adicionar quantos quiser!
 # ============================================================================
 filtros:
-  # Filtro 1: ANTT/SUFER - Autorizações Ferroviárias
-  - nome: "ANTT-SUFER-Autorizacoes"
-    secao: "DO1"  # DO1, DO2 ou DO3
-    orgao: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+  - nome: "ANTT-SUFER-Todas"
+    secao: "DO1"
+    orgao: "Superintendência de Transporte Ferroviário"  # ← Mais curto = pega tudo da SUFER
     keywords:
-      - "outorga por autorização ferroviária"
+      - "extrato"
+      - "requerimento"
       - "autorização"
 
   # ========================================================================
