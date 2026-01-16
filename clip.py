@@ -131,7 +131,10 @@ def init_db(db_path: str):
             filter_name TEXT NOT NULL,
             source_file TEXT NOT NULL,
             keyword_hit TEXT NOT NULL,
+            publication_title TEXT,
+            publication_date TEXT,
             text_snippet TEXT NOT NULL,
+            full_text TEXT,
             created_ts TEXT NOT NULL
         );
     """)
@@ -161,15 +164,21 @@ def mark_file_processed(db_path: str, filename: str, run_date: str):
     con.close()
 
 
-def insert_matches(db_path: str, matches: List[Tuple[str, str, str, str, str]]) -> int:
-    """Insere matches no banco. Retorna quantidade inserida."""
+def insert_matches(db_path: str, matches: List[Tuple[str, str, str, str, str, str, str]]) -> int:
+    """
+    Insere matches no banco. 
+    matches: lista de (run_date, filter_name, source_file, keyword, pub_title, pub_date, snippet, full_text)
+    Retorna quantidade inserida.
+    """
     if not matches:
         return 0
     
     con = sqlite3.connect(db_path)
     con.executemany(
-        "INSERT INTO matches (run_date, filter_name, source_file, keyword_hit, text_snippet, created_ts) VALUES (?, ?, ?, ?, ?, ?)",
-        [(m[0], m[1], m[2], m[3], m[4], datetime.utcnow().isoformat()) for m in matches]
+        """INSERT INTO matches 
+           (run_date, filter_name, source_file, keyword_hit, publication_title, publication_date, text_snippet, full_text, created_ts) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], datetime.utcnow().isoformat()) for m in matches]
     )
     con.commit()
     count = len(matches)
@@ -440,8 +449,83 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return '\n\n'.join(texts)
 
 
-def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str]]:
-    """Busca matches no texto baseado em um filtro"""
+def extract_publication(text: str, keyword_position: int) -> Tuple[str, str, str]:
+    """
+    Extrai publicação completa, título e data a partir da posição da keyword.
+    
+    Returns: (publication_title, publication_date, full_text)
+    """
+    lines = text.split('\n')
+    
+    # Encontra linha que contém a keyword
+    char_count = 0
+    target_line_idx = 0
+    for i, line in enumerate(lines):
+        if char_count + len(line) >= keyword_position:
+            target_line_idx = i
+            break
+        char_count += len(line) + 1  # +1 pelo \n
+    
+    # Padrões de início de publicação (títulos)
+    title_patterns = [
+        r'(DECISÃO\s+\w+\s+N[ºO°]\s*\d+.*?(?:\d{4}|\d{2}\s+DE\s+\w+\s+DE\s+\d{4}))',
+        r'(PORTARIA\s+\w+\s+N[ºO°]\s*\d+.*?(?:\d{4}|\d{2}\s+DE\s+\w+\s+DE\s+\d{4}))',
+        r'(DELIBERAÇÃO\s+\w+\s+N[ºO°]\s*\d+.*?(?:\d{4}|\d{2}\s+DE\s+\w+\s+DE\s+\d{4}))',
+        r'(INSTRUÇÃO\s+NORMATIVA\s+\w+\s+N[ºO°]\s*\d+.*?(?:\d{4}|\d{2}\s+DE\s+\w+\s+DE\s+\d{4}))',
+        r'(RETIFICAÇÃO.*?(?:\d{4}|\d{2}\s+DE\s+\w+\s+DE\s+\d{4}))',
+    ]
+    
+    # Procura título da publicação (pra trás até 50 linhas)
+    publication_title = ""
+    start_idx = target_line_idx
+    
+    for i in range(target_line_idx, max(0, target_line_idx - 50), -1):
+        line = lines[i].strip()
+        for pattern in title_patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                publication_title = match.group(1).strip()
+                start_idx = i
+                break
+        if publication_title:
+            break
+    
+    # Extrai data do título
+    publication_date = ""
+    date_match = re.search(r'(\d{1,2}\s+DE\s+\w+\s+DE\s+\d{4})', publication_title, re.IGNORECASE)
+    if date_match:
+        publication_date = date_match.group(1)
+    
+    # Procura fim da publicação (próximo título ou final)
+    end_idx = len(lines)
+    for i in range(start_idx + 1, min(len(lines), start_idx + 200)):
+        line = lines[i].strip()
+        # Se encontrar outro título de publicação, para
+        for pattern in title_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                end_idx = i
+                break
+        if end_idx < len(lines):
+            break
+    
+    # Extrai texto completo da publicação
+    full_text = '\n'.join(lines[start_idx:end_idx]).strip()
+    
+    # Se não achou título, usa primeiras 200 chars como título
+    if not publication_title and full_text:
+        publication_title = full_text[:200].replace('\n', ' ').strip()
+    
+    # Snippet: primeiras 500 chars do full_text
+    snippet = full_text[:500] if full_text else text[max(0, keyword_position-250):keyword_position+250]
+    
+    return publication_title, publication_date, snippet, full_text
+
+
+def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str, str, str]]:
+    """
+    Busca matches no texto baseado em um filtro.
+    Retorna lista de (keyword, publication_title, publication_date, snippet, full_text)
+    """
     matches = []
     text_lower = text.lower()
     
@@ -451,13 +535,29 @@ def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str]
     
     # Busca por palavras-chave
     for keyword in filter_config.keywords:
-        if keyword.lower() in text_lower:
-            idx = text_lower.find(keyword.lower())
-            start = max(0, idx - 250)
-            end = min(len(text), idx + 250)
-            snippet = text[start:end].strip()
+        keyword_lower = keyword.lower()
+        
+        # Encontra todas as ocorrências da keyword
+        idx = 0
+        seen_titles = set()  # Evita duplicatas
+        
+        while True:
+            idx = text_lower.find(keyword_lower, idx)
+            if idx == -1:
+                break
             
-            matches.append((keyword, snippet))
+            # Extrai publicação completa
+            pub_title, pub_date, snippet, full_text = extract_publication(text, idx)
+            
+            # Evita duplicatas (mesma publicação pode ter keyword múltiplas vezes)
+            if pub_title and pub_title not in seen_titles:
+                seen_titles.add(pub_title)
+                matches.append((keyword, pub_title, pub_date, snippet, full_text))
+            elif not pub_title:
+                # Se não achou título, usa snippet antigo (fallback)
+                matches.append((keyword, "", "", snippet, full_text[:2000] if full_text else snippet))
+            
+            idx += 1  # Próxima ocorrência
     
     return matches
 
@@ -474,17 +574,21 @@ def should_always_send_email() -> bool:
     return is_weekday and is_morning_run
 
 
-def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str, str, str]], force_send: bool = False):
+def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str, str, str, str, str, str]], force_send: bool = False):
     """Envia e-mail com os achados"""
     if not force_send and not matches:
         return False
     
     if matches:
         items_html = []
-        for i, (_, filter_name, source_file, keyword, snippet) in enumerate(matches, 1):
+        for i, (_, filter_name, source_file, keyword, pub_title, pub_date, snippet, _) in enumerate(matches, 1):
+            title_display = pub_title if pub_title else "Sem título identificado"
+            date_display = f" — {pub_date}" if pub_date else ""
+            
             items_html.append(f"""
                 <hr/>
-                <h3>Achado #{i} — Filtro: {filter_name}</h3>
+                <h3>Achado #{i} — {title_display}{date_display}</h3>
+                <p><b>Filtro:</b> {filter_name}</p>
                 <p><b>Palavra-chave:</b> <code>{keyword}</code></p>
                 <p><b>Arquivo fonte:</b> {source_file}</p>
                 <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 5px; border-left: 3px solid #007bff;">
@@ -598,13 +702,16 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
                         
                         matches = find_matches(text, filter_cfg)
                         
-                        for keyword, snippet in matches:
+                        for keyword, pub_title, pub_date, snippet, full_text in matches:
                             all_matches.append((
                                 check_date.isoformat(),
                                 filter_cfg.nome,
                                 filename,
                                 keyword,
-                                snippet
+                                pub_title,
+                                pub_date,
+                                snippet,
+                                full_text
                             ))
                         
                         mark_file_processed(config.db_path, filename, check_date.isoformat())
