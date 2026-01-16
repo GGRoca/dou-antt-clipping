@@ -328,23 +328,36 @@ class InlabsClient:
         
         return list(set(files))
     
-    def list_files(self, target_date: date, secao: str) -> List[str]:
-        """Lista arquivos com retry e re-login se necessário"""
+    def list_files(self, target_date: date, secao: str) -> Tuple[List[str], List[str]]:
+        """
+        Lista arquivos disponíveis para uma data e seção.
+        Retorna tupla (zips, pdfs) separados para priorização.
+        """
         try:
-            return retry_with_backoff(
+            all_files = retry_with_backoff(
                 lambda timeout: self._list_files_internal(target_date, secao, timeout),
                 operation_name=f"listagem de arquivos ({target_date.isoformat()})"
             )
+            
+            # Separa ZIPs e PDFs
+            zips = [f for f in all_files if f.endswith('.zip')]
+            pdfs = [f for f in all_files if f.endswith('.pdf')]
+            
+            return zips, pdfs
+            
         except RuntimeError as e:
             if "sessão expirou" in str(e).lower():
-                print("    ⚠️ Sessão expirou durante listagem, fazendo re-login...")
+                print("    ⚠️ Sessão expirou durante listagem, fazendo re-login...", flush=True)
+                sys.stdout.flush()
                 self._create_session()
                 self.login()
-                # Tenta novamente após re-login
-                return retry_with_backoff(
+                all_files = retry_with_backoff(
                     lambda timeout: self._list_files_internal(target_date, secao, timeout),
                     operation_name=f"listagem de arquivos após re-login"
                 )
+                zips = [f for f in all_files if f.endswith('.zip')]
+                pdfs = [f for f in all_files if f.endswith('.pdf')]
+                return zips, pdfs
             raise
     
     def _download_file_internal(self, target_date: date, filename: str, timeout=60) -> bytes:
@@ -532,12 +545,16 @@ def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str,
 # EXECUÇÃO PRINCIPAL
 # ============================================================================
 
-def run_for_date(config: Config, target_date: date, send_email_flag: bool = True, use_lookback: bool = True) -> int:
+def run_for_date(config: Config, target_date: date, send_email_flag: bool = True, use_lookback: bool = True, client: 'InlabsClient' = None) -> int:
     """Executa clipping para uma data específica"""
     init_db(config.db_path)
     
-    client = InlabsClient(config.inlabs_email, config.inlabs_password)
-    client.login()
+    # Cria cliente apenas se não foi passado (reutilização no backfill)
+    client_created = False
+    if client is None:
+        client = InlabsClient(config.inlabs_email, config.inlabs_password)
+        client.login()
+        client_created = True
     
     # Janela de busca
     if use_lookback:
@@ -557,8 +574,16 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
                 # Garante que está logado
                 client._ensure_logged_in()
                 
-                files = client.list_files(check_date, filter_cfg.secao)
-                new_files = [f for f in files if not was_file_processed(config.db_path, f)]
+                # Lista ZIPs e PDFs separados
+                zips, pdfs = client.list_files(check_date, filter_cfg.secao)
+                
+                # Prioridade: ZIPs primeiro, PDFs apenas se não houver ZIPs
+                if zips:
+                    files_to_process = zips
+                else:
+                    files_to_process = pdfs
+                
+                new_files = [f for f in files_to_process if not was_file_processed(config.db_path, f)]
                 
                 for filename in new_files:
                     try:
@@ -659,6 +684,14 @@ def main():
         print("(E-mails desabilitados, sem lookback - apenas D+0 por dia)\n", flush=True)
         sys.stdout.flush()
         
+        # Cria cliente UMA VEZ para todo o backfill
+        print("Inicializando cliente INLABS...", flush=True)
+        sys.stdout.flush()
+        client = InlabsClient(config.inlabs_email, config.inlabs_password)
+        client.login()
+        print("Cliente pronto. Iniciando processamento...\n", flush=True)
+        sys.stdout.flush()
+        
         current = start_date
         total_matches = 0
         
@@ -666,7 +699,8 @@ def main():
             print(f"Processando {current.isoformat()}...", end=' ', flush=True)
             sys.stdout.flush()
             
-            matches = run_for_date(config, current, send_email_flag=False, use_lookback=False)
+            # Passa cliente existente (reutiliza sessão)
+            matches = run_for_date(config, current, send_email_flag=False, use_lookback=False, client=client)
             total_matches += matches
             
             print(f"{matches} achado(s)", flush=True)
