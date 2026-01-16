@@ -13,20 +13,34 @@ lookback_days: 2
 # FILTROS: Você pode adicionar quantos quiser!
 # ============================================================================
 filtros:
-  - nome: "ANTT-SUFER-Todas"
+  # Filtro 1: SUFER
+  - nome: "SUFER-Todas"
     secao: "DO1"
-    orgao: "Superintendência de Transporte Ferroviário"  # ← Mais curto = pega tudo da SUFER
+    orgao: "Agência Nacional de Transportes Terrestres"
     keywords:
-      - "extrato"
-      - "requerimento"
-      - "autorização"
-      - "autorizar"
-      - "retificação"
-      - "decisão"
-      - "permissão de uso"
-      - "homologar"
+      - "SUFER"
+  
+  # Filtro 2: Portarias da ANTT
+  - nome: "ANTT-Portarias"
+    secao: "DO1"
+    orgao: "Agência Nacional de Transportes Terrestres"
+    keywords:
+      - "PORTARIA DG"
+  
+  # Filtro 3: Deliberações
+  - nome: "ANTT-Deliberacoes"
+    secao: "DO1"
+    orgao: "Diretoria Colegiada"
+    keywords:
+      - "DELIBERAÇÃO"
+  
+  # Filtro 4: Instruções Normativas
+  - nome: "ANTT-Instrucoes"
+    secao: "DO1"
+    orgao: "Diretoria Colegiada"
+    keywords:
+      - "INSTRUÇÃO NORMATIVA"
       
-
   # ========================================================================
   # EXEMPLOS DE COMO ADICIONAR MAIS FILTROS (descomente para ativar):
   # ========================================================================
