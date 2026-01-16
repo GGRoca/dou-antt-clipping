@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Clipping DOU - ANTT/SUFER via INLABS (Versão Final)
+Clipping DOU - ANTT/SUFER via INLABS (Versão Robusta)
 
-Características:
-- Janela de busca: D-2, D-1, D+0 (3 dias)
-- E-mail inteligente: sempre seg-sex 10:08, outros horários só com achados
-- ZIP preferencial + PDF fallback
-- Arquitetura extensível (multi-filtro)
-- Deduplicação automática
+Melhorias nesta versão:
+- Retry com backoff exponencial (3 tentativas)
+- Re-login automático quando sessão expira
+- Timeout progressivo (30s → 60s → 90s)
+- Tratamento robusto de erros de rede
+- Logs detalhados para debugging
 """
 import argparse
 import os
 import re
 import sqlite3
 import smtplib
+import time
 import zipfile
 from io import BytesIO
 from datetime import date, datetime, timedelta
@@ -59,7 +60,7 @@ class Config:
     email_to: List[str]
     email_subject_prefix: str
     db_path: str
-    lookback_days: int  # Janela de revarredura (padrão: 2 = D-2, D-1, D+0)
+    lookback_days: int
 
 
 def load_config(config_path: str) -> Config:
@@ -67,13 +68,11 @@ def load_config(config_path: str) -> Config:
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     
-    # Credenciais podem vir de variáveis de ambiente (GitHub Secrets)
     inlabs_email = os.getenv('INLABS_EMAIL', cfg['inlabs']['email'])
     inlabs_password = os.getenv('INLABS_PASSWORD', cfg['inlabs']['password'])
     smtp_user = os.getenv('SMTP_USER', cfg['mail']['smtp_user'])
     smtp_pass = os.getenv('SMTP_PASS', cfg['mail']['smtp_pass'])
     
-    # Carrega filtros (suporta múltiplos)
     filtros = []
     for f in cfg['filtros']:
         filtros.append(FilterConfig(
@@ -95,7 +94,7 @@ def load_config(config_path: str) -> Config:
         email_to=cfg['mail']['to_emails'],
         email_subject_prefix=cfg['mail']['subject_prefix'],
         db_path=cfg['storage']['db_path'],
-        lookback_days=cfg.get('lookback_days', 2),  # Padrão: 2 dias (D-2, D-1, D+0)
+        lookback_days=cfg.get('lookback_days', 2),
     )
 
 
@@ -189,51 +188,132 @@ def log_run(db_path: str, run_date: str, files_processed: int, matches_found: in
 
 
 # ============================================================================
-# INLABS CLIENT (autenticado)
+# RETRY HELPER
+# ============================================================================
+
+def retry_with_backoff(func, max_attempts=3, initial_timeout=30, backoff_factor=2, operation_name="operação"):
+    """
+    Executa função com retry e backoff exponencial.
+    
+    Args:
+        func: Função a executar (deve aceitar timeout como kwarg)
+        max_attempts: Número máximo de tentativas
+        initial_timeout: Timeout inicial em segundos
+        backoff_factor: Multiplicador do timeout a cada tentativa
+        operation_name: Nome da operação para logs
+    
+    Returns:
+        Resultado da função
+    
+    Raises:
+        Exception da última tentativa se todas falharem
+    """
+    timeout = initial_timeout
+    last_error = None
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"    {'⚠️ ' if attempt > 1 else ''}Tentando {operation_name} (tentativa {attempt}/{max_attempts}, timeout={timeout}s)")
+            result = func(timeout=timeout)
+            if attempt > 1:
+                print(f"    ✅ Sucesso na tentativa {attempt}")
+            return result
+        
+        except (requests.exceptions.Timeout, 
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError) as e:
+            last_error = e
+            
+            if attempt < max_attempts:
+                wait_time = timeout * (backoff_factor - 1)
+                print(f"    ⏱️ Timeout ou erro de conexão. Aguardando {wait_time}s antes da próxima tentativa...")
+                time.sleep(wait_time)
+                timeout = int(timeout * backoff_factor)
+            else:
+                print(f"    ❌ Falha após {max_attempts} tentativas")
+                raise
+        
+        except Exception as e:
+            # Outros erros não fazem retry
+            print(f"    ❌ Erro não recuperável: {type(e).__name__}: {e}")
+            raise
+    
+    # Nunca deve chegar aqui, mas por segurança
+    raise last_error
+
+
+# ============================================================================
+# INLABS CLIENT (autenticado com retry e re-login)
 # ============================================================================
 
 class InlabsClient:
-    """Cliente para acessar INLABS com autenticação"""
+    """Cliente para acessar INLABS com autenticação robusta"""
     
     def __init__(self, email: str, password: str):
+        self.email = email
+        self.password = password
+        self.session = None
+        self._create_session()
+    
+    def _create_session(self):
+        """Cria nova sessão"""
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
-        self._login(email, password)
     
-    def _login(self, email: str, password: str):
-        """Faz login no INLABS"""
+    def _login(self, timeout=30):
+        """Faz login no INLABS com retry"""
         login_url = "https://inlabs.in.gov.br/logar.php"
-        data = {"email": email, "password": password}
+        data = {"email": self.email, "password": self.password}
         
-        r = self.session.post(login_url, data=data, timeout=30)
+        r = self.session.post(login_url, data=data, timeout=timeout)
         
         if r.status_code != 200 or "sair" not in r.text.lower():
             raise RuntimeError("Falha no login do INLABS. Verifique credenciais.")
+        
+        return True
     
-    def list_files(self, target_date: date, secao: str) -> List[str]:
-        """
-        Lista arquivos disponíveis para uma data e seção.
-        
-        Args:
-            target_date: Data alvo
-            secao: "DO1", "DO2" ou "DO3"
-        
-        Returns:
-            Lista de nomes de arquivo (ZIPs e PDFs)
-        """
+    def login(self):
+        """Login público com retry"""
+        print("  🔐 Fazendo login no INLABS...")
+        retry_with_backoff(self._login, operation_name="login")
+        print("  ✅ Login bem-sucedido")
+    
+    def _ensure_logged_in(self):
+        """Garante que está logado, faz re-login se necessário"""
+        # Tenta fazer um request simples para testar sessão
+        try:
+            test_url = "https://inlabs.in.gov.br/index.php?p="
+            r = self.session.get(test_url, timeout=10)
+            
+            # Se retornar página de login, sessão expirou
+            if "acessar" in r.text.lower() or "login" in r.text.lower():
+                print("  ⚠️ Sessão expirou, fazendo re-login...")
+                self._create_session()
+                self.login()
+        except:
+            # Em caso de erro, faz re-login por segurança
+            print("  ⚠️ Erro ao verificar sessão, fazendo re-login...")
+            self._create_session()
+            self.login()
+    
+    def _list_files_internal(self, target_date: date, secao: str, timeout=30) -> List[str]:
+        """Lista arquivos (versão interna para retry)"""
         date_str = target_date.isoformat()
-        date_str_underscore = date_str.replace("-", "_")
         url = f"https://inlabs.in.gov.br/index.php?p={date_str}"
         
-        r = self.session.get(url, timeout=30)
+        r = self.session.get(url, timeout=timeout)
         text = r.text
         
-        files = []
-        secao_num = secao.replace("DO", "")  # "DO1" -> "1"
+        # Verifica se sessão expirou
+        if "acessar" in text.lower() or "login" in text.lower():
+            raise RuntimeError("Sessão expirou")
         
-        # ZIPs (normal + extras)
+        files = []
+        secao_num = secao.replace("DO", "")
+        
+        # ZIPs
         zip_patterns = [
             rf'(\d{{4}}-\d{{2}}-\d{{2}}-DO{secao_num}\.zip)',
             rf'(\d{{4}}-\d{{2}}-\d{{2}}-DO{secao_num}E\.zip)',
@@ -242,7 +322,7 @@ class InlabsClient:
         for pattern in zip_patterns:
             files.extend(re.findall(pattern, text))
         
-        # PDFs (normal + extras A, B, C)
+        # PDFs
         pdf_patterns = [
             rf'(\d{{4}}_\d{{2}}_\d{{2}}_ASSINADO_do{secao_num}\.pdf)',
             rf'(\d{{4}}_\d{{2}}_\d{{2}}_ASSINADO_do{secao_num}_extra_[ABC]\.pdf)',
@@ -251,25 +331,68 @@ class InlabsClient:
         for pattern in pdf_patterns:
             files.extend(re.findall(pattern, text))
         
-        # Remove duplicatas
         return list(set(files))
     
-    def download_file(self, target_date: date, filename: str) -> bytes:
-        """Baixa arquivo do INLABS"""
+    def list_files(self, target_date: date, secao: str) -> List[str]:
+        """Lista arquivos com retry e re-login se necessário"""
+        try:
+            return retry_with_backoff(
+                lambda timeout: self._list_files_internal(target_date, secao, timeout),
+                operation_name=f"listagem de arquivos ({target_date.isoformat()})"
+            )
+        except RuntimeError as e:
+            if "sessão expirou" in str(e).lower():
+                print("    ⚠️ Sessão expirou durante listagem, fazendo re-login...")
+                self._create_session()
+                self.login()
+                # Tenta novamente após re-login
+                return retry_with_backoff(
+                    lambda timeout: self._list_files_internal(target_date, secao, timeout),
+                    operation_name=f"listagem de arquivos após re-login"
+                )
+            raise
+    
+    def _download_file_internal(self, target_date: date, filename: str, timeout=60) -> bytes:
+        """Download de arquivo (versão interna para retry)"""
         date_str = target_date.isoformat()
         url = f"https://inlabs.in.gov.br/index.php?p={date_str}&dl={filename}"
         
-        r = self.session.get(url, timeout=60, stream=True)
+        r = self.session.get(url, timeout=timeout, stream=True)
         
         if r.status_code != 200:
             raise RuntimeError(f"Erro ao baixar {filename}: HTTP {r.status_code}")
         
-        # Verifica se é realmente um arquivo (não HTML)
+        # Verifica se é realmente um arquivo
         content_type = r.headers.get('content-type', '')
         if 'text/html' in content_type:
+            # Pode ser sessão expirada
+            chunk = next(r.iter_content(chunk_size=100), b'')
+            if b'acessar' in chunk.lower() or b'login' in chunk.lower():
+                raise RuntimeError("Sessão expirou")
             raise RuntimeError(f"INLABS retornou HTML em vez do arquivo {filename}")
         
         return r.content
+    
+    def download_file(self, target_date: date, filename: str) -> bytes:
+        """Download de arquivo com retry e re-login se necessário"""
+        try:
+            return retry_with_backoff(
+                lambda timeout: self._download_file_internal(target_date, filename, timeout),
+                operation_name=f"download de {filename}",
+                initial_timeout=60  # Download precisa de mais tempo
+            )
+        except RuntimeError as e:
+            if "sessão expirou" in str(e).lower():
+                print(f"    ⚠️ Sessão expirou durante download, fazendo re-login...")
+                self._create_session()
+                self.login()
+                # Tenta novamente após re-login
+                return retry_with_backoff(
+                    lambda timeout: self._download_file_internal(target_date, filename, timeout),
+                    operation_name=f"download de {filename} após re-login",
+                    initial_timeout=60
+                )
+            raise
 
 
 # ============================================================================
@@ -284,8 +407,6 @@ def extract_text_from_zip(zip_bytes: bytes) -> str:
         for name in zf.namelist():
             if name.lower().endswith('.xml'):
                 xml_content = zf.read(name).decode('utf-8', errors='ignore')
-                
-                # Remove tags XML
                 text = re.sub(r'<[^>]+>', ' ', xml_content)
                 text = re.sub(r'\s+', ' ', text).strip()
                 
@@ -312,10 +433,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 
 def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str]]:
-    """
-    Busca matches no texto baseado em um filtro.
-    Retorna lista de (keyword_matched, text_snippet).
-    """
+    """Busca matches no texto baseado em um filtro"""
     matches = []
     text_lower = text.lower()
     
@@ -326,7 +444,6 @@ def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str]
     # Busca por palavras-chave
     for keyword in filter_config.keywords:
         if keyword.lower() in text_lower:
-            # Extrai snippet ao redor da palavra-chave (500 chars)
             idx = text_lower.find(keyword.lower())
             start = max(0, idx - 250)
             end = min(len(text), idx + 250)
@@ -342,33 +459,18 @@ def find_matches(text: str, filter_config: FilterConfig) -> List[Tuple[str, str]
 # ============================================================================
 
 def should_always_send_email() -> bool:
-    """
-    Verifica se deve sempre enviar e-mail (mesmo sem achados).
-    Retorna True se for segunda a sexta entre 09:00 e 11:00 UTC (06:00-08:00 BRT -> 10:08 BRT).
-    """
+    """Verifica se deve sempre enviar e-mail (seg-sex ~10:08 BRT)"""
     now = datetime.utcnow()
-    
-    # Segunda (0) a Sexta (4)
     is_weekday = now.weekday() < 5
-    
-    # Entre 09:00 e 11:00 UTC (aproximação do horário 10:08 BRT)
     is_morning_run = 9 <= now.hour < 11
-    
     return is_weekday and is_morning_run
 
 
 def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str, str, str]], force_send: bool = False):
-    """
-    Envia e-mail com os achados.
-    
-    Args:
-        force_send: Se True, envia mesmo sem achados (para confirmação diária)
-    """
-    # Se não deve forçar envio e não há matches, não envia
+    """Envia e-mail com os achados"""
     if not force_send and not matches:
         return False
     
-    # Monta HTML
     if matches:
         items_html = []
         for i, (_, filter_name, source_file, keyword, snippet) in enumerate(matches, 1):
@@ -398,7 +500,6 @@ def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str,
         """
         subject = f"{config.email_subject_prefix} {run_date} — {len(matches)} achado(s)"
     else:
-        # E-mail de confirmação (sem achados)
         html_body = f"""
         <html>
         <body style="font-family: Arial, sans-serif;">
@@ -415,14 +516,12 @@ def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str,
         """
         subject = f"{config.email_subject_prefix} {run_date} — Sistema operacional (0 achados)"
     
-    # Monta mensagem
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = config.email_from
     msg['To'] = ', '.join(config.email_to)
     msg.attach(MIMEText(html_body, 'html', 'utf-8'))
     
-    # Envia
     try:
         with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=60) as server:
             server.starttls()
@@ -439,81 +538,67 @@ def send_email(config: Config, run_date: str, matches: List[Tuple[str, str, str,
 # ============================================================================
 
 def run_for_date(config: Config, target_date: date, send_email_flag: bool = True, use_lookback: bool = True) -> int:
-    """
-    Executa clipping para uma data específica com janela de lookback opcional.
-    
-    Args:
-        config: Configuração do sistema
-        target_date: Data alvo
-        send_email_flag: Se deve enviar e-mail
-        use_lookback: Se deve usar janela D-2, D-1, D+0 (True) ou apenas D+0 (False)
-    
-    Retorna número de matches encontrados.
-    """
+    """Executa clipping para uma data específica"""
     init_db(config.db_path)
     
     client = InlabsClient(config.inlabs_email, config.inlabs_password)
+    client.login()
     
-    # Janela de busca: com ou sem lookback
+    # Janela de busca
     if use_lookback:
-        # Diário: D-lookback até D+0 (captura extras tardias)
         dates_to_check = [target_date - timedelta(days=i) for i in range(config.lookback_days, -1, -1)]
     else:
-        # Backfill: apenas D+0 (dados históricos já estão completos)
         dates_to_check = [target_date]
     
     all_matches = []
     files_processed = 0
     
-    # Para cada filtro configurado
     for filter_cfg in config.filtros:
         print(f"  Filtro: {filter_cfg.nome} (Seção {filter_cfg.secao})")
         
-        # Para cada data na janela
         for check_date in dates_to_check:
-            # Lista arquivos
-            files = client.list_files(check_date, filter_cfg.secao)
-            new_files = [f for f in files if not was_file_processed(config.db_path, f)]
-            
-            # Processa cada arquivo
-            for filename in new_files:
-                try:
-                    # Download
-                    content = client.download_file(check_date, filename)
-                    
-                    # Parse (ZIP ou PDF)
-                    if filename.endswith('.zip'):
-                        text = extract_text_from_zip(content)
-                    elif filename.endswith('.pdf'):
-                        text = extract_text_from_pdf(content)
-                    else:
-                        continue
-                    
-                    # Busca matches
-                    matches = find_matches(text, filter_cfg)
-                    
-                    # Salva matches
-                    for keyword, snippet in matches:
-                        all_matches.append((
-                            check_date.isoformat(),
-                            filter_cfg.nome,
-                            filename,
-                            keyword,
-                            snippet
-                        ))
-                    
-                    # Marca como processado
-                    mark_file_processed(config.db_path, filename, check_date.isoformat())
-                    files_processed += 1
+            try:
+                # Garante que está logado
+                client._ensure_logged_in()
                 
-                except Exception as e:
-                    print(f"    Erro processando {filename}: {e}")
-                    continue
+                files = client.list_files(check_date, filter_cfg.secao)
+                new_files = [f for f in files if not was_file_processed(config.db_path, f)]
+                
+                for filename in new_files:
+                    try:
+                        content = client.download_file(check_date, filename)
+                        
+                        if filename.endswith('.zip'):
+                            text = extract_text_from_zip(content)
+                        elif filename.endswith('.pdf'):
+                            text = extract_text_from_pdf(content)
+                        else:
+                            continue
+                        
+                        matches = find_matches(text, filter_cfg)
+                        
+                        for keyword, snippet in matches:
+                            all_matches.append((
+                                check_date.isoformat(),
+                                filter_cfg.nome,
+                                filename,
+                                keyword,
+                                snippet
+                            ))
+                        
+                        mark_file_processed(config.db_path, filename, check_date.isoformat())
+                        files_processed += 1
+                    
+                    except Exception as e:
+                        print(f"    Erro processando {filename}: {e}")
+                        continue
+            
+            except Exception as e:
+                print(f"    Erro processando data {check_date}: {e}")
+                continue
     
-    # Insere matches no banco
     matches_count = insert_matches(config.db_path, all_matches)
     
-    # Decide se envia e-mail
     force_send = should_always_send_email()
     email_sent = False
     
@@ -521,7 +606,6 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
         if matches_count > 0 or force_send:
             email_sent = send_email(config, target_date.isoformat(), all_matches, force_send)
     
-    # Log da execução
     lookback_note = f"Lookback: {config.lookback_days} dias" if use_lookback else "Sem lookback (backfill)"
     log_run(
         config.db_path,
@@ -545,19 +629,15 @@ def main():
     
     subparsers = parser.add_subparsers(dest='command', required=True)
     
-    # Comando: run (execução única)
     run_parser = subparsers.add_parser('run', help='Executa clipping para uma data')
     run_parser.add_argument('--date', help='Data no formato YYYY-MM-DD (padrão: hoje)')
     run_parser.add_argument('--no-email', action='store_true', help='Não enviar e-mail')
     
-    # Comando: backfill (intervalo de datas)
     backfill_parser = subparsers.add_parser('backfill', help='Backfill para intervalo de datas')
     backfill_parser.add_argument('--start', required=True, help='Data inicial (YYYY-MM-DD)')
     backfill_parser.add_argument('--end', required=True, help='Data final (YYYY-MM-DD)')
     
     args = parser.parse_args()
-    
-    # Carrega config
     config = load_config(args.config)
     
     if args.command == 'run':
