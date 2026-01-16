@@ -20,6 +20,12 @@ filtros:
       - "extrato"
       - "requerimento"
       - "autorização"
+      - "autorizar"
+      - "retificação"
+      - "decisão"
+      - "permissão de uso"
+      - "homologar"
+      
 
   # ========================================================================
   # EXEMPLOS DE COMO ADICIONAR MAIS FILTROS (descomente para ativar):
