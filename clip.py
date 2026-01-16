@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import smtplib
+import sys
 import time
 import zipfile
 from io import BytesIO
@@ -194,29 +195,20 @@ def log_run(db_path: str, run_date: str, files_processed: int, matches_found: in
 def retry_with_backoff(func, max_attempts=3, initial_timeout=30, backoff_factor=2, operation_name="operação"):
     """
     Executa função com retry e backoff exponencial.
-    
-    Args:
-        func: Função a executar (deve aceitar timeout como kwarg)
-        max_attempts: Número máximo de tentativas
-        initial_timeout: Timeout inicial em segundos
-        backoff_factor: Multiplicador do timeout a cada tentativa
-        operation_name: Nome da operação para logs
-    
-    Returns:
-        Resultado da função
-    
-    Raises:
-        Exception da última tentativa se todas falharem
     """
     timeout = initial_timeout
     last_error = None
     
     for attempt in range(1, max_attempts + 1):
         try:
-            print(f"    {'⚠️ ' if attempt > 1 else ''}Tentando {operation_name} (tentativa {attempt}/{max_attempts}, timeout={timeout}s)")
+            print(f"    {'⚠️ ' if attempt > 1 else ''}Tentando {operation_name} (tentativa {attempt}/{max_attempts}, timeout={timeout}s)", flush=True)
+            sys.stdout.flush()
+            
             result = func(timeout=timeout)
+            
             if attempt > 1:
-                print(f"    ✅ Sucesso na tentativa {attempt}")
+                print(f"    ✅ Sucesso na tentativa {attempt}", flush=True)
+                sys.stdout.flush()
             return result
         
         except (requests.exceptions.Timeout, 
@@ -226,19 +218,20 @@ def retry_with_backoff(func, max_attempts=3, initial_timeout=30, backoff_factor=
             
             if attempt < max_attempts:
                 wait_time = timeout * (backoff_factor - 1)
-                print(f"    ⏱️ Timeout ou erro de conexão. Aguardando {wait_time}s antes da próxima tentativa...")
+                print(f"    ⏱️ Timeout ou erro de conexão. Aguardando {wait_time}s antes da próxima tentativa...", flush=True)
+                sys.stdout.flush()
                 time.sleep(wait_time)
                 timeout = int(timeout * backoff_factor)
             else:
-                print(f"    ❌ Falha após {max_attempts} tentativas")
+                print(f"    ❌ Falha após {max_attempts} tentativas", flush=True)
+                sys.stdout.flush()
                 raise
         
         except Exception as e:
-            # Outros erros não fazem retry
-            print(f"    ❌ Erro não recuperável: {type(e).__name__}: {e}")
+            print(f"    ❌ Erro não recuperável: {type(e).__name__}: {e}", flush=True)
+            sys.stdout.flush()
             raise
     
-    # Nunca deve chegar aqui, mas por segurança
     raise last_error
 
 
@@ -276,9 +269,11 @@ class InlabsClient:
     
     def login(self):
         """Login público com retry"""
-        print("  🔐 Fazendo login no INLABS...")
+        print("  🔐 Fazendo login no INLABS...", flush=True)
+        sys.stdout.flush()
         retry_with_backoff(self._login, operation_name="login")
-        print("  ✅ Login bem-sucedido")
+        print("  ✅ Login bem-sucedido", flush=True)
+        sys.stdout.flush()
     
     def _ensure_logged_in(self):
         """Garante que está logado, faz re-login se necessário"""
@@ -554,7 +549,8 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
     files_processed = 0
     
     for filter_cfg in config.filtros:
-        print(f"  Filtro: {filter_cfg.nome} (Seção {filter_cfg.secao})")
+        print(f"  Filtro: {filter_cfg.nome} (Seção {filter_cfg.secao})", flush=True)
+        sys.stdout.flush()
         
         for check_date in dates_to_check:
             try:
@@ -590,11 +586,13 @@ def run_for_date(config: Config, target_date: date, send_email_flag: bool = True
                         files_processed += 1
                     
                     except Exception as e:
-                        print(f"    Erro processando {filename}: {e}")
+                        print(f"    Erro processando {filename}: {e}", flush=True)
+                        sys.stdout.flush()
                         continue
             
             except Exception as e:
-                print(f"    Erro processando data {check_date}: {e}")
+                print(f"    Erro processando data {check_date}: {e}", flush=True)
+                sys.stdout.flush()
                 continue
     
     matches_count = insert_matches(config.db_path, all_matches)
@@ -644,30 +642,40 @@ def main():
         target_date = date.fromisoformat(args.date) if args.date else date.today()
         send_email = not args.no_email
         
-        print(f"Executando clipping para {target_date.isoformat()}...")
-        print(f"Janela: {config.lookback_days} dias (D-{config.lookback_days} até D+0)")
+        print(f"Executando clipping para {target_date.isoformat()}...", flush=True)
+        print(f"Janela: {config.lookback_days} dias (D-{config.lookback_days} até D+0)", flush=True)
+        sys.stdout.flush()
+        
         matches = run_for_date(config, target_date, send_email, use_lookback=True)
-        print(f"✓ Concluído: {matches} achado(s)")
+        
+        print(f"✓ Concluído: {matches} achado(s)", flush=True)
+        sys.stdout.flush()
     
     elif args.command == 'backfill':
         start_date = date.fromisoformat(args.start)
         end_date = date.fromisoformat(args.end)
         
-        print(f"Backfill de {start_date} até {end_date}")
-        print("(E-mails desabilitados, sem lookback - apenas D+0 por dia)\n")
+        print(f"Backfill de {start_date} até {end_date}", flush=True)
+        print("(E-mails desabilitados, sem lookback - apenas D+0 por dia)\n", flush=True)
+        sys.stdout.flush()
         
         current = start_date
         total_matches = 0
         
         while current <= end_date:
-            print(f"Processando {current.isoformat()}...", end=' ')
+            print(f"Processando {current.isoformat()}...", end=' ', flush=True)
+            sys.stdout.flush()
+            
             matches = run_for_date(config, current, send_email_flag=False, use_lookback=False)
             total_matches += matches
-            print(f"{matches} achado(s)")
+            
+            print(f"{matches} achado(s)", flush=True)
+            sys.stdout.flush()
             
             current += timedelta(days=1)
         
-        print(f"\n✓ Backfill concluído: {total_matches} achado(s) no total")
+        print(f"\n✓ Backfill concluído: {total_matches} achado(s) no total", flush=True)
+        sys.stdout.flush()
 
 
 if __name__ == '__main__':
