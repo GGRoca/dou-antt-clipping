@@ -25,9 +25,9 @@ filtros:
     secao: "DO1"
     orgao: "Agência Nacional de Transportes Terrestres"
     keywords:
-      - "PORTARIA DG"
+      - "PORTARIA"
   
-  # Filtro 3: Deliberações
+  # Filtro 3: Deliberações da Diretoria Colegiada
   - nome: "ANTT-Deliberacoes"
     secao: "DO1"
     orgao: "Diretoria Colegiada"
@@ -40,6 +40,13 @@ filtros:
     orgao: "Diretoria Colegiada"
     keywords:
       - "INSTRUÇÃO NORMATIVA"
+  
+  # Filtro 5: Retificações da ANTT
+  - nome: "ANTT-Retificacoes"
+    secao: "DO1"
+    orgao: "Agência Nacional de Transportes Terrestres"
+    keywords:
+      - "RETIFICAÇÃO"
       
   # ========================================================================
   # EXEMPLOS DE COMO ADICIONAR MAIS FILTROS (descomente para ativar):
