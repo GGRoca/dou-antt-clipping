@@ -1,97 +1,82 @@
-# Configuração do Clipping DOU - Arquitetura Multi-Filtro
+# Clipping DOU - ANTT/SUFER
 
 inlabs:
-  # Credenciais do INLABS (podem vir de variáveis de ambiente)
-  email: ""  # ou deixe vazio para usar INLABS_EMAIL
-  password: ""  # ou deixe vazio para usar INLABS_PASSWORD
+  email: ""     # vazio = usa Secret INLABS_EMAIL
+  password: ""  # vazio = usa Secret INLABS_PASSWORD
 
-# Janela de revarredura (lookback)
-# 2 = busca D-2, D-1, D+0 (últimos 3 dias)
 lookback_days: 2
 
 # ============================================================================
-# FILTROS: Você pode adicionar quantos quiser!
+# FILTROS
+#
+# orgao      → substring de artCategory (hierarquia do DOU)
+# art_types  → lista de artType exato; vazio = todos os tipos do órgão
+#
+# Hierarquia no DOU:
+#   "Ministério dos Transportes"
+#     └─ "Agência Nacional de Transportes Terrestres"  (artCategory contém só isso → publ. da ANTT/Diretoria)
+#          └─ "Superintendência de Transporte Ferroviário"  (artCategory contém isso → publicações da SUFER)
+#          └─ "Diretoria Colegiada"                         (artCategory contém isso → deliberações, etc.)
+#
+# Para pegar TUDO da SUFER, use orgao = "Superintendência de Transporte Ferroviário"
+# Para pegar Deliberações da Diretoria, use orgao = "Diretoria Colegiada"
 # ============================================================================
+
 filtros:
-  # Filtro 1: SUFER
+
+  # Tudo que a SUFER publicar, qualquer artType
   - nome: "SUFER-Todas"
     secao: "DO1"
-    orgao: "Agência Nacional de Transportes Terrestres"
-    keywords:
-      - "SUFER"
-  
-  # Filtro 2: Portarias da ANTT
-  - nome: "ANTT-Portarias"
-    secao: "DO1"
-    orgao: "Agência Nacional de Transportes Terrestres"
-    keywords:
-      - "PORTARIA"
-  
-  # Filtro 3: Deliberações da Diretoria Colegiada
+    orgao: "Superintendência de Transporte Ferroviário"
+    art_types: []
+
+  # Deliberações da Diretoria Colegiada
   - nome: "ANTT-Deliberacoes"
     secao: "DO1"
     orgao: "Diretoria Colegiada"
-    keywords:
-      - "DELIBERAÇÃO"
-  
-  # Filtro 4: Instruções Normativas
+    art_types: ["Deliberação"]
+
+  # Portarias (qualquer unidade da ANTT)
+  - nome: "ANTT-Portarias"
+    secao: "DO1"
+    orgao: "Agência Nacional de Transportes Terrestres"
+    art_types: ["Portaria"]
+
+  # Instruções Normativas
   - nome: "ANTT-Instrucoes"
     secao: "DO1"
-    orgao: "Diretoria Colegiada"
-    keywords:
-      - "INSTRUÇÃO NORMATIVA"
-  
-  # Filtro 5: Retificações da ANTT
+    orgao: "Agência Nacional de Transportes Terrestres"
+    art_types: ["Instrução Normativa"]
+
+  # Retificações
   - nome: "ANTT-Retificacoes"
     secao: "DO1"
     orgao: "Agência Nacional de Transportes Terrestres"
-    keywords:
-      - "RETIFICAÇÃO"
-      
-  # ========================================================================
-  # EXEMPLOS DE COMO ADICIONAR MAIS FILTROS (descomente para ativar):
-  # ========================================================================
-  
-  # Filtro 2: ANTT/SUFER - Regulação
-  # - nome: "ANTT-SUFER-Regulacao"
-  #   secao: "DO1"
-  #   orgao: "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
-  #   keywords:
-  #     - "regulação"
-  #     - "norma"
-  #     - "resolução"
-  
-  # Filtro 3: Ministro dos Transportes
-  # - nome: "MinTransportes-Ministro-Renan"
+    art_types: ["Retificação"]
+
+  # ── Exemplos (descomente para ativar) ──────────────────────────────────────
+
+  # Tudo do Ministério dos Transportes (ministro, DG, etc.)
+  # - nome: "MinTransportes-Todas"
   #   secao: "DO1"
   #   orgao: "Ministério dos Transportes"
-  #   keywords:
-  #     - "Renan Filho"
-  #     - "Ministro de Estado"
-  
-  # Filtro 4: ANTT - Seção 3 (contratos)
-  # - nome: "ANTT-Contratos"
-  #   secao: "DO3"
-  #   orgao: "Agência Nacional de Transportes Terrestres"
-  #   keywords:
-  #     - "contrato"
-  #     - "licitação"
+  #   art_types: []
 
-# ============================================================================
-# E-MAIL
-# ============================================================================
+  # Resoluções da ANTT
+  # - nome: "ANTT-Resolucoes"
+  #   secao: "DO1"
+  #   orgao: "Agência Nacional de Transportes Terrestres"
+  #   art_types: ["Resolução"]
+
 mail:
   smtp_host: "smtp.gmail.com"
   smtp_port: 587
-  smtp_user: ""  # ou deixe vazio para usar SMTP_USER
-  smtp_pass: ""  # ou deixe vazio para usar SMTP_PASS
+  smtp_user: ""  # vazio = usa Secret SMTP_USER
+  smtp_pass: ""  # vazio = usa Secret SMTP_PASS
   from_email: "guilherme.artintel@gmail.com"
   to_emails:
     - "guiroca@gmail.com"
   subject_prefix: "[DOU][ANTT][SUFER]"
 
-# ============================================================================
-# ARMAZENAMENTO
-# ============================================================================
 storage:
   db_path: "data/clipping.sqlite"
