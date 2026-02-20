@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Clipping DOU - ANTT via INLABS
-Versão 3.0 — Correções:
-  - Login robusto com debug completo (detecta mudanças no INLABS)
-  - Parser XML estruturado (lê <orgao>, <titulo>, <texto> separados)
-  - Matching por órgão + keywords mais preciso e sem falsos negativos
-  - Re-login automático com backoff
-  - Logs detalhados em cada etapa
+Clipping DOU - ANTT via INLABS  v4.0
+Mudancas nesta versao:
+  - match_in="orgao": retorna TUDO do orgao sem checar keywords no corpo
+  - match_in="titulo": keyword verificada APENAS no titulo/identificador
+  - Email mostra texto COMPLETO da publicacao formatado como no DOU
+  - Publication extrai metadados: data, edicao, secao, pagina, assinatura
+  - Login com debug detalhado e deteccao de manutencao
 """
 import argparse
 import os
@@ -15,10 +15,11 @@ import sqlite3
 import smtplib
 import sys
 import time
+import unicodedata
 import zipfile
 from io import BytesIO
 from datetime import date, datetime, timedelta
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -28,28 +29,37 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 
+
+class InlabsMaintenanceError(Exception):
+    pass
+
+
 try:
     import PyPDF2
     HAS_PYPDF2 = True
 except ImportError:
     try:
-        from pypdf import PdfReader as _PdfReader
+        from pypdf import PdfReader as _R
         HAS_PYPDF2 = True
-        PyPDF2 = type("_Fake", (), {"PdfReader": _PdfReader})()
+        PyPDF2 = type("_F", (), {"PdfReader": _R})()
     except ImportError:
         HAS_PYPDF2 = False
 
 
 # ============================================================================
-# CONFIGURAÇÃO
+# CONFIGURACAO
 # ============================================================================
 
 @dataclass
 class FilterConfig:
     nome: str
-    secao: str           # DO1, DO2, DO3
-    orgao: str           # substring que deve aparecer na tag <orgao>
-    keywords: List[str]  # qualquer uma dessas palavras no texto basta
+    secao: str
+    orgao: str
+    keywords: List[str]
+    match_in: str = "titulo"
+    # match_in:
+    #   "orgao"  -> captura TUDO do orgao, sem verificar keywords no corpo
+    #   "titulo" -> keyword deve aparecer no titulo/identificador do ato
 
 
 @dataclass
@@ -83,7 +93,8 @@ def load_config(config_path: str) -> Config:
             nome=f["nome"],
             secao=f["secao"],
             orgao=f["orgao"],
-            keywords=f["keywords"],
+            keywords=f.get("keywords", []),
+            match_in=f.get("match_in", "titulo"),
         ))
 
     return Config(
@@ -180,7 +191,8 @@ def insert_matches(db_path: str, matches: list) -> int:
 def log_run(db_path, run_date, files_processed, matches_found, email_sent, notes=""):
     con = sqlite3.connect(db_path)
     con.execute(
-        "INSERT INTO runs (run_ts,run_date,files_processed,matches_found,email_sent,notes) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO runs (run_ts,run_date,files_processed,matches_found,email_sent,notes) "
+        "VALUES (?,?,?,?,?,?)",
         (datetime.utcnow().isoformat(), run_date, files_processed,
          matches_found, 1 if email_sent else 0, notes),
     )
@@ -193,31 +205,19 @@ def log_run(db_path, run_date, files_processed, matches_found, email_sent, notes
 # ============================================================================
 
 class InlabsClient:
-    """
-    Acesso ao portal INLABS com:
-    - Debug detalhado do login (mostra o que o servidor retorna)
-    - Retry + backoff
-    - Re-login automático quando sessão expira
-    """
-
-    BASE = "https://inlabs.in.gov.br"
+    BASE      = "https://inlabs.in.gov.br"
     LOGIN_URL = f"{BASE}/logar.php"
     INDEX_URL = f"{BASE}/index.php"
 
-    # Indicadores de que a resposta é a página logada
-    LOGGED_IN_SIGNALS = ["sair", "logout", "minha conta", "meu perfil",
-                         "index.php?p=", "download", "arquivo"]
-    # Indicadores de que caiu na página de login (sessão expirou)
-    LOGIN_PAGE_SIGNALS = ["acessar", "senha", "login", "e-mail", "entrar",
-                          "logar.php", "esqueci"]
+    LOGGED_IN_SIGNALS   = ["sair", "logout", "minha conta", "index.php?p=", "download"]
+    LOGIN_PAGE_SIGNALS  = ["acessar", "senha", "login", "e-mail", "entrar", "logar.php"]
+    MAINTENANCE_SIGNALS = ["manutencao programada", "maintenance",
+                           "tente novamente mais tarde", "manutenção"]
 
     def __init__(self, email: str, password: str):
         self.email = email
         self.password = password
         self.session = self._new_session()
-        self._logged_in = False
-
-    # ── helpers ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _new_session() -> requests.Session:
@@ -229,218 +229,172 @@ class InlabsClient:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "pt-BR,pt;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
         return s
 
     @staticmethod
     def _looks_logged_in(html: str) -> bool:
         low = html.lower()
-        return any(sig in low for sig in InlabsClient.LOGGED_IN_SIGNALS)
+        return any(s in low for s in InlabsClient.LOGGED_IN_SIGNALS)
 
     @staticmethod
     def _looks_like_login_page(html: str) -> bool:
         low = html.lower()
-        return any(sig in low for sig in InlabsClient.LOGIN_PAGE_SIGNALS)
+        return any(s in low for s in InlabsClient.LOGIN_PAGE_SIGNALS)
+
+    @staticmethod
+    def _is_maintenance(r: requests.Response) -> bool:
+        if r.status_code in (502, 503, 504):
+            body = unicodedata.normalize("NFD", r.text.lower()).encode("ascii", "ignore").decode()
+            return any(s in body for s in InlabsClient.MAINTENANCE_SIGNALS)
+        return False
 
     def _debug_response(self, label: str, r: requests.Response):
-        """Imprime diagnóstico completo para ajudar a entender falhas."""
-        print(f"\n  ── DEBUG [{label}] ──────────────────────────────────────────", flush=True)
+        print(f"\n  -- DEBUG [{label}] --", flush=True)
         print(f"  URL:    {r.url}", flush=True)
         print(f"  Status: {r.status_code}", flush=True)
         print(f"  Content-Type: {r.headers.get('content-type', 'N/A')}", flush=True)
-        print(f"  Redirect history: {[rr.url for rr in r.history]}", flush=True)
-        # Mostra primeiras e últimas 600 chars do body
+        print(f"  Redirects: {[rr.url for rr in r.history]}", flush=True)
         body = r.text
-        preview = body[:600].replace("\n", " ").strip()
-        tail    = body[-300:].replace("\n", " ").strip() if len(body) > 600 else ""
-        print(f"  Body (início): {preview}", flush=True)
-        if tail:
-            print(f"  Body (fim):    {tail}", flush=True)
-        print(f"  ─────────────────────────────────────────────────────────────", flush=True)
-
-    # ── login ─────────────────────────────────────────────────────────────────
+        print(f"  Body (inicio): {body[:500].replace(chr(10), ' ').strip()}", flush=True)
+        if len(body) > 500:
+            print(f"  Body (fim):    {body[-300:].replace(chr(10), ' ').strip()}", flush=True)
+        print("  --", flush=True)
 
     def _attempt_login(self, timeout: int = 30) -> bool:
-        """
-        Tenta login e retorna True se bem-sucedido.
-        Estratégia:
-          1. GET na raiz para pegar cookies/CSRF se houver
-          2. POST no logar.php com credenciais
-          3. Verifica resposta com múltiplos sinais
-        """
-        # Passo 1: visita a raiz para obter cookies de sessão iniciais
         try:
-            r0 = self.session.get(self.BASE, timeout=timeout)
-            print(f"    GET {self.BASE} → {r0.status_code}", flush=True)
-        except Exception as e:
-            print(f"    Aviso: falha ao acessar raiz ({e}), continua...", flush=True)
+            self.session.get(self.BASE, timeout=timeout)
+        except Exception:
+            pass
 
-        # Passo 2: tenta extrair CSRF token da página de login (se existir)
         csrf_token = None
         try:
-            r_login_page = self.session.get(self.LOGIN_URL, timeout=timeout)
-            soup = BeautifulSoup(r_login_page.text, "html.parser")
+            r_lp = self.session.get(self.LOGIN_URL, timeout=timeout)
+            soup = BeautifulSoup(r_lp.text, "html.parser")
             for inp in soup.find_all("input", {"type": "hidden"}):
                 name = inp.get("name", "").lower()
-                if "csrf" in name or "token" in name or "_token" in name:
+                if any(x in name for x in ("csrf", "token", "_token")):
                     csrf_token = inp.get("value", "")
-                    print(f"    CSRF token encontrado: {inp.get('name')} = {csrf_token[:20]}...", flush=True)
                     break
-        except Exception as e:
-            print(f"    Aviso: não foi possível buscar CSRF ({e})", flush=True)
+        except Exception:
+            pass
 
-        # Passo 3: monta payload
-        payload: Dict[str, str] = {
-            "email":    self.email,
-            "password": self.password,
-            # alguns sistemas usam "senha" ou "pass"
-        }
+        payload = {"email": self.email, "password": self.password}
         if csrf_token:
-            # Tenta adivinhar o nome do campo CSRF
-            payload["_token"]      = csrf_token
-            payload["csrf_token"]  = csrf_token
-            payload["token"]       = csrf_token
+            payload["_token"] = csrf_token
 
-        # Passo 4: POST
-        r = self.session.post(
-            self.LOGIN_URL,
-            data=payload,
-            timeout=timeout,
-            allow_redirects=True,
-        )
+        r = self.session.post(self.LOGIN_URL, data=payload, timeout=timeout, allow_redirects=True)
+
+        if self._is_maintenance(r):
+            raise InlabsMaintenanceError(
+                f"INLABS em manutencao programada (HTTP {r.status_code}). "
+                "O sistema voltara automaticamente na proxima execucao."
+            )
+
         self._debug_response("POST login", r)
 
-        # Passo 5: avalia resposta
         if self._looks_logged_in(r.text):
-            print("    ✅ Login confirmado (sinal de sessão ativa encontrado)", flush=True)
-            self._logged_in = True
+            print("    OK Login confirmado", flush=True)
             return True
 
-        # Tenta seguir redirect manual se houver
         if r.status_code in (301, 302, 303, 307, 308):
             loc = r.headers.get("Location", "")
-            print(f"    Redirect para: {loc}", flush=True)
-            r2 = self.session.get(loc if loc.startswith("http") else self.BASE + loc,
-                                  timeout=timeout)
-            self._debug_response("GET após redirect", r2)
+            r2 = self.session.get(
+                loc if loc.startswith("http") else self.BASE + loc, timeout=timeout
+            )
+            self._debug_response("GET apos redirect", r2)
             if self._looks_logged_in(r2.text):
-                print("    ✅ Login confirmado após redirect", flush=True)
-                self._logged_in = True
+                print("    OK Login confirmado apos redirect", flush=True)
                 return True
 
-        # Se chegou até aqui, login falhou
-        print("    ❌ Nenhum sinal de sessão ativa encontrado na resposta", flush=True)
+        print("    ERRO Nenhum sinal de sessao ativa encontrado", flush=True)
         return False
 
     def login(self, max_attempts: int = 3):
-        """Login público com retry e backoff."""
-        print("  🔐 Iniciando login no INLABS...", flush=True)
-
+        print("  Iniciando login no INLABS...", flush=True)
         wait = 15
         for attempt in range(1, max_attempts + 1):
             print(f"  Tentativa {attempt}/{max_attempts}...", flush=True)
             try:
+                r_probe = self.session.get(self.LOGIN_URL, timeout=30)
+                if self._is_maintenance(r_probe):
+                    raise InlabsMaintenanceError(
+                        f"INLABS em manutencao (HTTP {r_probe.status_code})."
+                    )
                 if self._attempt_login(timeout=30 + (attempt - 1) * 30):
-                    print("  ✅ Login bem-sucedido", flush=True)
+                    print("  Login bem-sucedido", flush=True)
                     return
-                else:
-                    print(f"  ⚠️ Login falhou na tentativa {attempt}. "
-                          f"Verifique credenciais e o debug acima.", flush=True)
+                print(f"  Login falhou na tentativa {attempt}.", flush=True)
+            except InlabsMaintenanceError:
+                raise
             except Exception as e:
-                print(f"  ⚠️ Exceção na tentativa {attempt}: {type(e).__name__}: {e}", flush=True)
+                print(f"  Excecao: {type(e).__name__}: {e}", flush=True)
 
             if attempt < max_attempts:
-                print(f"  Aguardando {wait}s antes da próxima tentativa...", flush=True)
+                print(f"  Aguardando {wait}s...", flush=True)
                 time.sleep(wait)
                 wait *= 2
-                # recria sessão
                 self.session = self._new_session()
 
         raise RuntimeError(
-            "Falha no login do INLABS após todas as tentativas. "
-            "Verifique INLABS_EMAIL / INLABS_PASSWORD nos GitHub Secrets "
-            "e analise o debug acima para entender o que o servidor retornou."
+            "Falha no login do INLABS apos todas as tentativas. "
+            "Verifique INLABS_EMAIL / INLABS_PASSWORD nos GitHub Secrets."
         )
 
-    # ── verificação de sessão ────────────────────────────────────────────────
-
     def _ensure_session(self):
-        """Verifica sessão; faz re-login se necessário."""
         try:
-            r = self.session.get(self.INDEX_URL, params={"p": date.today().isoformat()},
-                                 timeout=15)
+            r = self.session.get(
+                self.INDEX_URL, params={"p": date.today().isoformat()}, timeout=15
+            )
             if self._looks_like_login_page(r.text) and not self._looks_logged_in(r.text):
-                print("    ⚠️ Sessão expirada — re-login...", flush=True)
+                print("    Sessao expirada -- re-login...", flush=True)
                 self.session = self._new_session()
-                self._logged_in = False
                 self.login()
+        except InlabsMaintenanceError:
+            raise
         except Exception as e:
-            print(f"    ⚠️ Erro ao verificar sessão ({e}) — re-login preventivo...", flush=True)
+            print(f"    Erro ao verificar sessao ({e}) -- re-login preventivo...", flush=True)
             self.session = self._new_session()
-            self._logged_in = False
             self.login()
 
-    # ── listagem de arquivos ──────────────────────────────────────────────────
-
     def list_files(self, target_date: date, secao: str) -> Tuple[List[str], List[str]]:
-        """
-        Lista ZIPs e PDFs disponíveis para a data/seção.
-        Retorna (zips, pdfs).
-        """
         self._ensure_session()
         date_str = target_date.isoformat()
-        sec_num = secao.replace("DO", "")
+        sec_num  = secao.replace("DO", "")
 
         for attempt in range(1, 4):
             try:
                 r = self.session.get(
-                    self.INDEX_URL,
-                    params={"p": date_str},
+                    self.INDEX_URL, params={"p": date_str},
                     timeout=30 + attempt * 15,
                 )
                 break
             except requests.exceptions.Timeout:
                 if attempt == 3:
                     raise
-                print(f"    Timeout ao listar {date_str}, tentando novamente...", flush=True)
                 time.sleep(10 * attempt)
         else:
             return [], []
 
         text = r.text
-
-        # ZIPs principais e extras
         zip_pats = [
             rf"({re.escape(date_str)}-DO{sec_num}\.zip)",
             rf"({re.escape(date_str)}-DO{sec_num}E\.zip)",
             rf"({re.escape(date_str)}-DO{sec_num}[A-Z]\.zip)",
         ]
-        # PDFs (formato antigo do INLABS)
         date_us = date_str.replace("-", "_")
         pdf_pats = [
             rf"({date_us}_ASSINADO_do{sec_num}\.pdf)",
             rf"({date_us}_ASSINADO_do{sec_num}_extra_[A-Za-z]\.pdf)",
-            # variante sem 'ASSINADO'
             rf"({date_us}_do{sec_num}\.pdf)",
         ]
 
-        zips, pdfs = [], []
-        for pat in zip_pats:
-            zips.extend(re.findall(pat, text))
-        for pat in pdf_pats:
-            pdfs.extend(re.findall(pat, text))
-
-        zips = list(set(zips))
-        pdfs = list(set(pdfs))
-
+        zips = list(set(m for p in zip_pats for m in re.findall(p, text)))
+        pdfs = list(set(m for p in pdf_pats for m in re.findall(p, text)))
         print(f"    {date_str} {secao}: {len(zips)} ZIP(s), {len(pdfs)} PDF(s)", flush=True)
         return zips, pdfs
 
-    # ── download ──────────────────────────────────────────────────────────────
-
     def download_file(self, target_date: date, filename: str) -> bytes:
-        """Download com retry/re-login."""
         self._ensure_session()
         date_str = target_date.isoformat()
 
@@ -452,285 +406,306 @@ class InlabsClient:
                     timeout=60 + attempt * 30,
                     stream=True,
                 )
-                content_type = r.headers.get("content-type", "")
-
-                if r.status_code == 200 and "html" not in content_type.lower():
+                ct = r.headers.get("content-type", "")
+                if r.status_code == 200 and "html" not in ct.lower():
                     data = r.content
-                    print(f"    ✓ Download {filename}: {len(data):,} bytes", flush=True)
+                    print(f"    Download OK {filename}: {len(data):,} bytes", flush=True)
                     return data
-
-                # Pode ser sessão expirada
-                if "html" in content_type.lower():
+                if "html" in ct.lower():
                     chunk = r.content[:200].lower()
-                    if b"acessar" in chunk or b"login" in chunk or b"senha" in chunk:
-                        print(f"    ⚠️ Sessão expirada durante download — re-login...", flush=True)
+                    if any(s in chunk for s in (b"acessar", b"login", b"senha")):
+                        print("    Sessao expirada durante download -- re-login...", flush=True)
                         self.session = self._new_session()
-                        self._logged_in = False
                         self.login()
                         continue
-
-                raise RuntimeError(
-                    f"Resposta inesperada para {filename}: "
-                    f"HTTP {r.status_code} / content-type: {content_type}"
-                )
-
+                raise RuntimeError(f"HTTP {r.status_code} / {ct} ao baixar {filename}")
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                 if attempt == 3:
                     raise
-                print(f"    ⚠️ Erro de rede no download ({e}), tentativa {attempt}/3...", flush=True)
                 time.sleep(15 * attempt)
 
-        raise RuntimeError(f"Não foi possível baixar {filename} após 3 tentativas")
+        raise RuntimeError(f"Nao foi possivel baixar {filename} apos 3 tentativas")
 
 
 # ============================================================================
-# PARSER XML (estruturado)
+# PUBLICATION -- estrutura de dados
 # ============================================================================
-
-def _tag_text(element, *tags) -> str:
-    """Lê texto de um sub-elemento (retorna '' se não encontrar)."""
-    for tag in tags:
-        el = element.find(tag)
-        if el is not None and el.text:
-            return el.text.strip()
-    return ""
-
-
-def _all_text(element) -> str:
-    """Texto completo de um elemento (incluindo filhos)."""
-    return " ".join((element.itertext() or [])).strip()
-
 
 @dataclass
 class Publication:
-    """Representa uma publicação individual do DOU."""
     orgao: str
     titulo: str
-    identifica: str  # subtítulo / identificador do ato
-    texto: str       # corpo da publicação
-    raw: str         # texto bruto para fallback
+    identifica: str
+    texto: str
+    pub_data: str   = ""
+    edicao: str     = ""
+    secao: str      = ""
+    pagina: str     = ""
+    assinatura: str = ""
+    cargo: str      = ""
+
+
+def _el_text(element: ET.Element, *tags: str) -> str:
+    """Busca texto em sub-elementos, tentando multiplas variantes de nome de tag."""
+    for tag in tags:
+        for variant in (tag, tag.upper(), tag.lower(), tag.capitalize()):
+            el = element.find(variant)
+            if el is not None:
+                return "".join(el.itertext()).strip()
+    return ""
+
+
+def _all_text(element: ET.Element) -> str:
+    return " ".join(element.itertext()).strip()
 
 
 def parse_xml_publications(xml_bytes: bytes) -> List[Publication]:
     """
-    Lê um XML do INLABS e extrai lista de publicações estruturadas.
-    O INLABS usa diferentes schemas; tenta os mais comuns.
+    Extrai publicacoes estruturadas de um XML do INLABS.
+    Tenta multiplas variantes de schema.
     """
-    pubs = []
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as e:
-        print(f"    ⚠️ XML malformado: {e}. Usando extração de texto bruto.", flush=True)
+        print(f"    XML malformado: {e}", flush=True)
         return []
 
-    # Schema 1: <TEXTO_ORGANIZADO> ou <materia>
-    # Procura qualquer tag que contenha <ORGAO> ou <orgao>
-    for el in root.iter():
-        tag = el.tag.lower()
+    # Metadados globais do arquivo
+    global_data  = _el_text(root, "DATA",  "data",  "dataPublicacao")
+    global_edicao= _el_text(root, "EDICAO","edicao","numeroEdicao")
+    global_secao = _el_text(root, "SECAO", "secao", "numSecao")
 
-        # Pula tags folha e de estrutura
-        if tag in ("dou", "diario", "secao", "data", "numero", "pagina",
-                   "assinatura", "cargo", "emissor"):
+    def _find_pub_elements(node: ET.Element, depth: int = 0) -> List[ET.Element]:
+        results = []
+        for child in node:
+            has_orgao  = (child.find("orgao")  is not None or
+                          child.find("ORGAO")  is not None)
+            has_titulo = (child.find("titulo") is not None or
+                          child.find("TITULO") is not None)
+            has_texto  = (child.find("texto")  is not None or
+                          child.find("TEXTO")  is not None)
+
+            if (has_orgao or has_titulo) and has_texto:
+                results.append(child)
+            elif depth < 6:
+                results.extend(_find_pub_elements(child, depth + 1))
+        return results
+
+    pub_elements = _find_pub_elements(root)
+
+    # Varredura plana como fallback
+    if not pub_elements:
+        for el in root.iter():
+            has_orgao  = el.find("orgao")  is not None or el.find("ORGAO")  is not None
+            has_titulo = el.find("titulo") is not None or el.find("TITULO") is not None
+            has_texto  = el.find("texto")  is not None or el.find("TEXTO")  is not None
+            if (has_orgao or has_titulo) and has_texto:
+                pub_elements.append(el)
+
+    print(f"    XML: {len(pub_elements)} publicacao(oes) encontrada(s)", flush=True)
+
+    pubs: List[Publication] = []
+    seen: set = set()
+
+    for el in pub_elements:
+        orgao      = _el_text(el, "orgao",      "ORGAO")
+        titulo     = _el_text(el, "titulo",     "TITULO")
+        identifica = _el_text(el, "identifica", "IDENTIFICA", "subtitulo", "SUBTITULO")
+        texto      = _el_text(el, "texto",      "TEXTO")
+        pub_data   = _el_text(el, "data",       "DATA",  "dataPublicacao")  or global_data
+        edicao     = _el_text(el, "edicao",     "EDICAO","numeroEdicao")    or global_edicao
+        secao_pub  = _el_text(el, "secao",      "SECAO", "numSecao")        or global_secao
+        pagina     = _el_text(el, "pagina",     "PAGINA","numeroPagina")
+        assinatura = _el_text(el, "assinatura", "ASSINATURA", "signatario", "SIGNATARIO")
+        cargo      = _el_text(el, "cargo",      "CARGO")
+
+        if not orgao and not titulo:
             continue
 
-        # Heurística: elemento que tem tanto filho de orgão quanto de texto
-        orgao_el  = el.find("orgao")   or el.find("ORGAO")
-        titulo_el = el.find("titulo")  or el.find("TITULO")
-        texto_el  = el.find("texto")   or el.find("TEXTO")
-        ident_el  = (el.find("identifica") or el.find("IDENTIFICA")
-                     or el.find("subtitulo") or el.find("SUBTITULO"))
-
-        if orgao_el is None and titulo_el is None:
+        key = (orgao[:80], titulo[:80])
+        if key in seen:
             continue
-
-        orgao     = _all_text(orgao_el)  if orgao_el  is not None else ""
-        titulo    = _all_text(titulo_el) if titulo_el is not None else ""
-        identifica= _all_text(ident_el)  if ident_el  is not None else ""
-        texto     = _all_text(texto_el)  if texto_el  is not None else ""
-        raw       = _all_text(el)
-
-        if not (orgao or titulo):
-            continue
+        seen.add(key)
 
         pubs.append(Publication(
-            orgao=orgao,
-            titulo=titulo,
-            identifica=identifica,
-            texto=texto,
-            raw=raw,
+            orgao=orgao, titulo=titulo, identifica=identifica, texto=texto,
+            pub_data=pub_data, edicao=edicao, secao=secao_pub,
+            pagina=pagina, assinatura=assinatura, cargo=cargo,
         ))
 
-    # Deduplica (mesmo orgao + titulo)
-    seen = set()
-    unique = []
-    for p in pubs:
-        key = (p.orgao[:80], p.titulo[:80])
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-
-    return unique
+    return pubs
 
 
 def extract_publications_from_zip(zip_bytes: bytes) -> Tuple[List[Publication], str]:
-    """
-    Extrai publicações de todos os XMLs dentro do ZIP.
-    Retorna (lista de publicações estruturadas, texto bruto completo para fallback).
-    """
     pubs: List[Publication] = []
     raw_texts: List[str] = []
 
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
-        print(f"    ZIP contém {len(xml_names)} XML(s)", flush=True)
-
+        print(f"    ZIP contem {len(xml_names)} XML(s)", flush=True)
         for name in xml_names:
-            xml_bytes_file = zf.read(name)
-            file_pubs = parse_xml_publications(xml_bytes_file)
-            pubs.extend(file_pubs)
-
-            # Texto bruto como fallback
-            raw = xml_bytes_file.decode("utf-8", errors="ignore")
-            raw_clean = re.sub(r"<[^>]+>", " ", raw)
-            raw_clean = re.sub(r"\s+", " ", raw_clean).strip()
-            raw_texts.append(raw_clean)
+            data = zf.read(name)
+            pubs.extend(parse_xml_publications(data))
+            raw = data.decode("utf-8", errors="ignore")
+            raw_texts.append(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)).strip())
 
     return pubs, "\n\n".join(raw_texts)
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extrai texto de PDF via PyPDF2/pypdf."""
     if not HAS_PYPDF2:
-        raise RuntimeError("PyPDF2 não instalado")
+        raise RuntimeError("PyPDF2 nao instalado")
     reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
-    parts = []
-    for page in reader.pages:
-        t = page.extract_text() or ""
-        if t.strip():
-            parts.append(t.strip())
-    return "\n\n".join(parts)
+    return "\n\n".join(
+        p.extract_text().strip() for p in reader.pages if p.extract_text()
+    )
 
 
 # ============================================================================
 # MATCHING
 # ============================================================================
 
-def normalize(text: str) -> str:
-    """Normaliza texto para comparação insensível a acentos/case."""
-    import unicodedata
+def _norm(text: str) -> str:
     return unicodedata.normalize("NFD", text.lower()).encode("ascii", "ignore").decode()
 
 
 def orgao_matches(pub_orgao: str, filter_orgao: str) -> bool:
-    """
-    Verifica se o órgão da publicação corresponde ao filtro.
-    Usa matching flexível:
-    - substring normalizada
-    - qualquer palavra-chave do filtro (splitada por '/')
-    """
     if not pub_orgao:
         return False
-    norm_pub = normalize(pub_orgao)
-    # Testa o termo inteiro
-    if normalize(filter_orgao) in norm_pub:
+    norm_pub = _norm(pub_orgao)
+    if _norm(filter_orgao) in norm_pub:
         return True
-    # Testa cada parte separada por '/' (hierarquia do DOU)
     for part in filter_orgao.split("/"):
         part = part.strip()
-        if part and normalize(part) in norm_pub:
+        if part and _norm(part) in norm_pub:
             return True
     return False
 
 
-def keyword_matches(pub: Publication, keyword: str) -> Tuple[bool, str]:
+def titulo_has_keyword(pub: Publication, keyword: str) -> bool:
+    """Keyword deve estar APENAS no titulo ou identificador -- nao no corpo."""
+    norm_kw = _norm(keyword)
+    return (norm_kw in _norm(pub.titulo) or norm_kw in _norm(pub.identifica))
+
+
+def format_publication(pub: Publication, pub_date_fallback: str = "") -> str:
     """
-    Retorna (hit, snippet) se a keyword aparece em qualquer campo da publicação.
-    Snippet: 400 chars ao redor da primeira ocorrência.
+    Formata uma publicacao como aparece no DOU.
+    Sem metadados do sistema (sem filtro, sem keyword, sem arquivo fonte).
     """
-    norm_kw = normalize(keyword)
-    # Campos onde buscar (em ordem de prioridade)
-    fields = [
-        ("titulo",     pub.titulo),
-        ("identifica", pub.identifica),
-        ("texto",      pub.texto),
-        ("raw",        pub.raw),
-    ]
-    for field_name, field_val in fields:
-        norm_val = normalize(field_val)
-        idx = norm_val.find(norm_kw)
-        if idx != -1:
-            # Snippet do texto original (não normalizado)
-            start = max(0, idx - 200)
-            end   = min(len(field_val), idx + 200)
-            snippet = field_val[start:end].strip()
-            return True, snippet
-    return False, ""
+    lines = []
+    lines.append("Diario Oficial da Uniao")
+
+    meta_parts = []
+    if pub.pub_data or pub_date_fallback:
+        meta_parts.append(f"Publicado em: {pub.pub_data or pub_date_fallback}")
+    if pub.edicao:
+        meta_parts.append(f"Edicao: {pub.edicao}")
+    if pub.secao:
+        meta_parts.append(f"Secao: {pub.secao}")
+    if pub.pagina:
+        meta_parts.append(f"Pagina: {pub.pagina}")
+    if meta_parts:
+        lines.append(" | ".join(meta_parts))
+
+    if pub.orgao:
+        lines.append(f"Orgao: {pub.orgao}")
+
+    lines.append("")
+
+    if pub.titulo:
+        lines.append(pub.titulo)
+    if pub.identifica and pub.identifica != pub.titulo:
+        lines.append(pub.identifica)
+
+    lines.append("")
+
+    if pub.texto:
+        lines.append(pub.texto)
+
+    if pub.assinatura or pub.cargo:
+        lines.append("")
+        if pub.assinatura:
+            lines.append(pub.assinatura)
+        if pub.cargo:
+            lines.append(pub.cargo)
+
+    return "\n".join(lines).strip()
 
 
 def find_matches_in_publications(
     pubs: List[Publication],
     raw_fallback: str,
     filter_cfg: FilterConfig,
+    pub_date_fallback: str = "",
 ) -> List[Tuple[str, str, str, str, str]]:
     """
-    Aplica um filtro à lista de publicações.
-    Retorna lista de (keyword, titulo, data_pub, snippet, full_text).
+    Retorna lista de (keyword_hit, titulo, pub_date, formatted_text, full_text).
+
+    match_in="orgao":  tudo do orgao, sem verificar keyword no corpo
+    match_in="titulo": keyword deve estar no titulo/identificador
     """
     results = []
-    seen_titles = set()
+    seen_titles: set = set()
 
-    # ── Matching estruturado (via XML parseado) ──────────────────────────────
     for pub in pubs:
         if not orgao_matches(pub.orgao, filter_cfg.orgao):
             continue
 
-        for kw in filter_cfg.keywords:
-            hit, snippet = keyword_matches(pub, kw)
-            if hit:
-                title_key = normalize(pub.titulo[:80])
-                if title_key in seen_titles:
-                    continue
-                seen_titles.add(title_key)
+        if filter_cfg.match_in == "orgao":
+            key = _norm(pub.titulo[:80]) or _norm(pub.texto[:40])
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            formatted = format_publication(pub, pub_date_fallback)
+            results.append(("(orgao)", pub.titulo, pub.pub_data, formatted, formatted))
 
-                # Monta full_text
-                full_text = "\n".join(filter(None, [
-                    f"Órgão:    {pub.orgao}",
-                    f"Título:   {pub.titulo}",
-                    f"Ident.:   {pub.identifica}" if pub.identifica else "",
-                    "",
-                    pub.texto or pub.raw,
-                ]))
-
-                results.append((kw, pub.titulo, "", snippet[:500], full_text[:4000]))
-
-    # ── Fallback: texto bruto (quando XML não parseou bem) ──────────────────
-    if not results and raw_fallback:
-        print(f"    Usando fallback de texto bruto para filtro '{filter_cfg.nome}'", flush=True)
-        raw_lower = normalize(raw_fallback)
-        orgao_norm = normalize(filter_cfg.orgao)
-
-        # Divide por linha e busca blocos que contenham o órgão
-        # Para texto bruto, fazemos matching simples de substring
-        if orgao_norm not in raw_lower:
-            # Tenta partes do orgao
-            orgao_parts = [normalize(p.strip()) for p in filter_cfg.orgao.split("/") if p.strip()]
-            has_orgao = any(p in raw_lower for p in orgao_parts)
-        else:
-            has_orgao = True
-
-        if has_orgao:
+        elif filter_cfg.match_in == "titulo":
             for kw in filter_cfg.keywords:
-                kw_norm = normalize(kw)
-                idx = raw_lower.find(kw_norm)
-                if idx != -1:
-                    start = max(0, idx - 250)
-                    end   = min(len(raw_fallback), idx + 250)
-                    snippet = raw_fallback[start:end].strip()
-                    key = kw_norm[:40]
-                    if key not in seen_titles:
-                        seen_titles.add(key)
-                        results.append((kw, "(texto bruto — XML sem estrutura)", "",
-                                        snippet[:500], raw_fallback[:3000]))
+                if titulo_has_keyword(pub, kw):
+                    key = _norm(pub.titulo[:80])
+                    if key in seen_titles:
+                        break
+                    seen_titles.add(key)
+                    formatted = format_publication(pub, pub_date_fallback)
+                    results.append((kw, pub.titulo, pub.pub_data, formatted, formatted))
+                    break
+
+    # Fallback texto bruto (apenas quando XML nao parseou)
+    if not results and raw_fallback:
+        orgao_parts = [p.strip() for p in filter_cfg.orgao.split("/") if p.strip()]
+        orgao_found = any(_norm(p) in _norm(raw_fallback) for p in orgao_parts)
+
+        if orgao_found and filter_cfg.match_in == "orgao":
+            print(
+                f"    AVISO: fallback texto bruto para '{filter_cfg.nome}' "
+                f"(XML sem estrutura reconhecida)", flush=True
+            )
+            results.append((
+                "(fallback)",
+                "XML sem estrutura -- verificar manualmente no INLABS",
+                pub_date_fallback,
+                (f"O orgao '{filter_cfg.orgao}' foi encontrado no arquivo mas o XML "
+                 f"nao pudo ser parseado em publicacoes individuais.\n"
+                 f"Verifique o arquivo diretamente no portal INLABS."),
+                raw_fallback[:1000],
+            ))
+        elif orgao_found and filter_cfg.match_in == "titulo":
+            for kw in filter_cfg.keywords:
+                if _norm(kw) in _norm(raw_fallback):
+                    print(
+                        f"    AVISO: fallback texto bruto para '{filter_cfg.nome}' "
+                        f"(XML sem estrutura)", flush=True
+                    )
+                    results.append((
+                        kw,
+                        "XML sem estrutura -- verificar manualmente no INLABS",
+                        pub_date_fallback,
+                        (f"Keyword '{kw}' encontrada no arquivo mas o XML "
+                         f"nao pude ser parseado. Verifique no portal INLABS."),
+                        raw_fallback[:1000],
+                    ))
+                    break
 
     return results
 
@@ -740,54 +715,81 @@ def find_matches_in_publications(
 # ============================================================================
 
 def should_always_send_email() -> bool:
-    """Seg–Sex, entre 09h–11h UTC (≈ 06h–08h BRT ou 10h–12h BRT dependendo do DST)."""
     now = datetime.utcnow()
     return now.weekday() < 5 and 9 <= now.hour < 11
 
 
-def send_email(config: Config, run_date: str, matches: list, force_send: bool = False) -> bool:
+def send_email(
+    config: Config,
+    run_date: str,
+    matches: list,
+    force_send: bool = False,
+) -> bool:
     if not force_send and not matches:
         return False
 
     if matches:
         items_html = []
-        for i, (_, filter_name, source_file, keyword, pub_title, pub_date, snippet, _) in enumerate(matches, 1):
-            title_display = pub_title or "Sem título identificado"
-            date_display  = f" — {pub_date}" if pub_date else ""
+        for i, (_, filter_name, source_file, keyword_hit, pub_title, pub_date,
+                formatted_text, full_text) in enumerate(matches, 1):
+
+            text_to_show = formatted_text or full_text or ""
+            # Escapa HTML e preserva quebras de linha
+            text_html = (
+                text_to_show
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\n", "<br>\n")
+            )
+
             items_html.append(f"""
-                <hr/>
-                <h3>Achado #{i} — {title_display}{date_display}</h3>
-                <p><b>Filtro:</b> {filter_name}</p>
-                <p><b>Palavra-chave:</b> <code>{keyword}</code></p>
-                <p><b>Arquivo fonte:</b> {source_file}</p>
-                <pre style="white-space:pre-wrap;font-family:monospace;
-                            background:#f5f5f5;padding:10px;border-radius:5px;
-                            border-left:3px solid #007bff;">{snippet}</pre>
+                <div style="margin-bottom:32px; padding:20px 24px;
+                            border:1px solid #dee2e6; border-radius:6px;
+                            background:#ffffff; border-left: 4px solid #28a745;">
+                  <div style="font-size:11px; color:#6c757d; margin-bottom:12px;
+                              text-transform:uppercase; letter-spacing:0.5px;">
+                    Filtro: {filter_name}
+                  </div>
+                  <div style="font-family:Georgia, serif; font-size:14px;
+                              line-height:1.7; color:#212529;">
+                    {text_html}
+                  </div>
+                </div>
             """)
-        html_body = f"""
-        <html><body style="font-family:Arial,sans-serif;">
-            <h2 style="color:#28a745;">{config.email_subject_prefix} {run_date}</h2>
-            <p><b>✅ Total de achados: {len(matches)}</b></p>
-            {''.join(items_html)}
-            <hr/>
-            <p style="color:#666;font-size:12px;">
-                Clipping automático via INLABS<br/>
-                Seções monitoradas: {', '.join(sorted(set(f.secao for f in config.filtros)))}
-            </p>
-        </body></html>"""
-        subject = f"{config.email_subject_prefix} {run_date} — {len(matches)} achado(s)"
+
+        html_body = f"""<!DOCTYPE html>
+<html>
+<body style="font-family:Arial,sans-serif; background:#f8f9fa;
+             padding:24px; margin:0;">
+  <div style="max-width:860px; margin:0 auto;">
+    <h2 style="color:#28a745; margin-bottom:4px; font-size:20px;">
+      {config.email_subject_prefix} {run_date}
+    </h2>
+    <p style="color:#495057; margin-top:4px; margin-bottom:24px;">
+      <strong>{len(matches)}</strong> publicacao(oes) encontrada(s)
+    </p>
+    {''.join(items_html)}
+    <p style="font-size:11px; color:#adb5bd; margin-top:24px; border-top:1px solid #dee2e6; padding-top:12px;">
+      Clipping automatico via INLABS | DOU Secao 1
+    </p>
+  </div>
+</body>
+</html>"""
+        subject = f"{config.email_subject_prefix} {run_date} — {len(matches)} publicacao(oes)"
+
     else:
-        html_body = f"""
-        <html><body style="font-family:Arial,sans-serif;">
-            <h2 style="color:#6c757d;">{config.email_subject_prefix} {run_date}</h2>
-            <p><b>✓ Sistema operacional</b></p>
-            <p>Nenhuma publicação encontrada com os critérios de busca.</p>
-            <hr/>
-            <p style="color:#666;font-size:12px;">
-                E-mail de confirmação diária (seg–sex, ≈10h BRT).
-            </p>
-        </body></html>"""
-        subject = f"{config.email_subject_prefix} {run_date} — Sistema operacional (0 achados)"
+        html_body = f"""<!DOCTYPE html>
+<html>
+<body style="font-family:Arial,sans-serif; padding:24px; color:#495057;">
+  <h2 style="color:#6c757d;">{config.email_subject_prefix} {run_date}</h2>
+  <p>Sistema operacional. Nenhuma publicacao encontrada hoje.</p>
+  <p style="font-size:11px; color:#adb5bd;">
+    E-mail de confirmacao diaria (seg-sex, aprox. 10h BRT).
+  </p>
+</body>
+</html>"""
+        subject = f"{config.email_subject_prefix} {run_date} — 0 publicacoes"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -800,15 +802,15 @@ def send_email(config: Config, run_date: str, matches: list, force_send: bool = 
             srv.starttls()
             srv.login(config.smtp_user, config.smtp_pass)
             srv.sendmail(config.email_from, config.email_to, msg.as_string())
-        print(f"  📧 E-mail enviado: {subject}", flush=True)
+        print(f"  E-mail enviado: {subject}", flush=True)
         return True
     except Exception as e:
-        print(f"  ❌ Erro ao enviar e-mail: {e}", flush=True)
+        print(f"  ERRO ao enviar e-mail: {e}", flush=True)
         return False
 
 
 # ============================================================================
-# EXECUÇÃO PRINCIPAL
+# EXECUCAO PRINCIPAL
 # ============================================================================
 
 def run_for_date(
@@ -820,24 +822,25 @@ def run_for_date(
 ) -> int:
     init_db(config.db_path)
 
-    owned_client = client is None
-    if owned_client:
+    if client is None:
         client = InlabsClient(config.inlabs_email, config.inlabs_password)
         client.login()
 
-    if use_lookback:
-        dates_to_check = [
-            target_date - timedelta(days=i)
-            for i in range(config.lookback_days, -1, -1)
-        ]
-    else:
-        dates_to_check = [target_date]
+    dates_to_check = (
+        [target_date - timedelta(days=i) for i in range(config.lookback_days, -1, -1)]
+        if use_lookback
+        else [target_date]
+    )
 
-    all_matches = []
+    all_matches: list = []
     files_processed = 0
 
     for filter_cfg in config.filtros:
-        print(f"\n  ▸ Filtro: {filter_cfg.nome} (seção {filter_cfg.secao})", flush=True)
+        print(
+            f"\n  Filtro: {filter_cfg.nome} "
+            f"(secao={filter_cfg.secao}, match_in={filter_cfg.match_in})",
+            flush=True,
+        )
 
         for check_date in dates_to_check:
             print(f"    Data: {check_date.isoformat()}", flush=True)
@@ -845,47 +848,49 @@ def run_for_date(
             try:
                 zips, pdfs = client.list_files(check_date, filter_cfg.secao)
             except Exception as e:
-                print(f"    ❌ Erro ao listar arquivos: {e}", flush=True)
+                print(f"    ERRO ao listar: {e}", flush=True)
                 continue
 
-            # Prioridade: ZIPs (têm XML estruturado); PDFs como fallback
             candidates = zips if zips else pdfs
             new_files  = [f for f in candidates if not was_file_processed(config.db_path, f)]
 
             if not new_files:
-                print(f"    Nenhum arquivo novo para processar.", flush=True)
+                print("    Nenhum arquivo novo.", flush=True)
                 continue
 
             for filename in new_files:
-                print(f"    ⬇️  Baixando {filename}...", flush=True)
+                print(f"    Baixando {filename}...", flush=True)
                 try:
                     content = client.download_file(check_date, filename)
                 except Exception as e:
-                    print(f"    ❌ Erro no download de {filename}: {e}", flush=True)
+                    print(f"    ERRO no download: {e}", flush=True)
                     continue
 
-                # Extrai publicações
                 pubs: List[Publication] = []
                 raw_fallback = ""
                 try:
                     if filename.endswith(".zip"):
                         pubs, raw_fallback = extract_publications_from_zip(content)
-                        print(f"    Extraídas {len(pubs)} publicações do ZIP.", flush=True)
+                        print(f"    Total de publicacoes no ZIP: {len(pubs)}", flush=True)
                     elif filename.endswith(".pdf"):
                         raw_fallback = extract_text_from_pdf(content)
-                        print(f"    PDF extraído ({len(raw_fallback):,} chars).", flush=True)
                     else:
                         print(f"    Formato desconhecido: {filename}", flush=True)
                         continue
                 except Exception as e:
-                    print(f"    ❌ Erro ao extrair {filename}: {e}", flush=True)
+                    print(f"    ERRO na extracao: {e}", flush=True)
                     continue
 
-                # Aplica filtro
-                hits = find_matches_in_publications(pubs, raw_fallback, filter_cfg)
-                print(f"    Filtro '{filter_cfg.nome}': {len(hits)} achado(s)", flush=True)
+                hits = find_matches_in_publications(
+                    pubs, raw_fallback, filter_cfg,
+                    pub_date_fallback=check_date.strftime("%d/%m/%Y"),
+                )
+                print(
+                    f"    '{filter_cfg.nome}': {len(hits)} publicacao(oes) encontrada(s)",
+                    flush=True,
+                )
 
-                for kw, pub_title, pub_date, snippet, full_text in hits:
+                for kw, pub_title, pub_date, formatted, full_text in hits:
                     all_matches.append((
                         check_date.isoformat(),
                         filter_cfg.nome,
@@ -893,7 +898,7 @@ def run_for_date(
                         kw,
                         pub_title,
                         pub_date,
-                        snippet,
+                        formatted,
                         full_text,
                     ))
 
@@ -907,9 +912,11 @@ def run_for_date(
     if send_email_flag and (matches_count > 0 or force_send):
         email_sent = send_email(config, target_date.isoformat(), all_matches, force_send)
 
-    lookback_note = f"Lookback: {config.lookback_days}d" if use_lookback else "Sem lookback"
-    log_run(config.db_path, target_date.isoformat(), files_processed, matches_count,
-            email_sent, notes=f"{lookback_note}, {files_processed} arquivo(s)")
+    log_run(
+        config.db_path, target_date.isoformat(), files_processed, matches_count,
+        email_sent,
+        notes=f"{'Lookback' if use_lookback else 'Sem lookback'}, {files_processed} arquivo(s)",
+    )
 
     return matches_count
 
@@ -919,7 +926,7 @@ def run_for_date(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Clipping DOU — ANTT via INLABS")
+    parser = argparse.ArgumentParser(description="Clipping DOU -- ANTT via INLABS")
     parser.add_argument("--config", default="config.yml")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -937,37 +944,46 @@ def main():
     if args.command == "run":
         target_date = date.fromisoformat(args.date) if args.date else date.today()
         print(f"\n{'='*60}", flush=True)
-        print(f"Clipping DOU — {target_date.isoformat()}", flush=True)
+        print(f"Clipping DOU -- {target_date.isoformat()}", flush=True)
         print(f"Filtros: {[f.nome for f in config.filtros]}", flush=True)
-        print(f"Janela:  D-{config.lookback_days} … D+0", flush=True)
+        print(f"Janela:  D-{config.lookback_days} ... D+0", flush=True)
         print(f"{'='*60}\n", flush=True)
-
-        matches = run_for_date(config, target_date, not args.no_email, use_lookback=True)
-        print(f"\n✓ Concluído: {matches} achado(s)", flush=True)
+        try:
+            matches = run_for_date(config, target_date, not args.no_email, use_lookback=True)
+            print(f"\nConcluido: {matches} publicacao(oes)", flush=True)
+        except InlabsMaintenanceError as e:
+            print(f"\nINLABS em manutencao: {e}", flush=True)
+            print("Encerrado sem erro -- retentado na proxima execucao.", flush=True)
+            sys.exit(0)
 
     elif args.command == "backfill":
         start_date = date.fromisoformat(args.start)
         end_date   = date.fromisoformat(args.end)
-
-        print(f"\nBackfill: {start_date} → {end_date}", flush=True)
-        print("(sem e-mail, sem lookback — apenas D+0 por dia)\n", flush=True)
-
-        client = InlabsClient(config.inlabs_email, config.inlabs_password)
-        client.login()
+        print(f"\nBackfill: {start_date} -> {end_date}", flush=True)
+        print("(sem e-mail, sem lookback)\n", flush=True)
+        try:
+            client = InlabsClient(config.inlabs_email, config.inlabs_password)
+            client.login()
+        except InlabsMaintenanceError as e:
+            print(f"\nINLABS em manutencao: {e}", flush=True)
+            sys.exit(0)
 
         current = start_date
         total   = 0
         while current <= end_date:
-            print(f"\n{'─'*50}", flush=True)
+            print(f"\n{'-'*50}", flush=True)
             print(f"Processando {current.isoformat()}...", flush=True)
-            n = run_for_date(config, current, send_email_flag=False,
-                             use_lookback=False, client=client)
+            try:
+                n = run_for_date(config, current, send_email_flag=False,
+                                 use_lookback=False, client=client)
+            except InlabsMaintenanceError as e:
+                print(f"\nINLABS em manutencao: {e}", flush=True)
+                sys.exit(0)
             total += n
             current += timedelta(days=1)
-            # Pequena pausa para não sobrecarregar o servidor
             time.sleep(2)
 
-        print(f"\n✓ Backfill concluído: {total} achado(s) no total", flush=True)
+        print(f"\nBackfill concluido: {total} publicacao(oes)", flush=True)
 
 
 if __name__ == "__main__":
