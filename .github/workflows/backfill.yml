@@ -4,82 +4,45 @@ on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: 'Data inicial (YYYY-MM-DD)'
+        description: "Data inicial (YYYY-MM-DD)"
         required: true
-        default: '2023-01-01'
       end_date:
-        description: 'Data final (YYYY-MM-DD)'
+        description: "Data final (YYYY-MM-DD)"
         required: true
-        default: '2025-12-31'
 
 permissions:
   contents: write
 
+concurrency:
+  group: clipping-db
+  cancel-in-progress: false
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # 2 horas max
-    
+    timeout-minutes: 120
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
+          python-version: "3.12"
+          cache: pip
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+      - name: Restaurar banco do branch 'data'
+        run: bash scripts/restore_db.sh
 
-      - name: Restore database from branch 'data'
-        run: |
-          mkdir -p data
-          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
-            git fetch origin data
-            git show origin/data:data/clipping.sqlite > data/clipping.sqlite 2>/dev/null || echo "No DB yet"
-          fi
-
-      - name: Run backfill (NO EMAIL)
+      - name: Backfill (sem e-mail; achados marcados como 'backfill')
         env:
           INLABS_EMAIL: ${{ secrets.INLABS_EMAIL }}
           INLABS_PASSWORD: ${{ secrets.INLABS_PASSWORD }}
-        run: |
-          python clip.py --config config.yml backfill \
-            --start ${{ github.event.inputs.start_date }} \
-            --end ${{ github.event.inputs.end_date }}
+          START: ${{ inputs.start_date }}
+          END: ${{ inputs.end_date }}
+        run: python clip.py backfill --start "$START" --end "$END"
 
-      - name: Persist database to branch 'data'
-        run: |
-          if [ ! -f data/clipping.sqlite ]; then
-            echo "✗ Database not found!"
-            exit 1
-          fi
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          cp data/clipping.sqlite /tmp/clipping.sqlite
-          
-          # Limpa referências locais
-          git branch -D data 2>/dev/null || true
-          
-          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
-            git fetch origin data:refs/remotes/origin/data
-            git checkout -b data origin/data
-          else
-            git checkout --orphan data
-            git rm -rf . >/dev/null 2>&1 || true
-          fi
-          
-          mkdir -p data
-          mv /tmp/clipping.sqlite data/clipping.sqlite
-          
-          git add data/clipping.sqlite
-          git commit -m "Backfill: ${{ github.event.inputs.start_date }} to ${{ github.event.inputs.end_date }}" || echo "No changes"
-          git push -u origin data
-          
-          echo "✓ Database persisted"
+      - name: Persistir banco no branch 'data'
+        if: always()
+        run: bash scripts/persist_db.sh

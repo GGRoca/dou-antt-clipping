@@ -2,91 +2,78 @@ name: Clipping Diário
 
 on:
   schedule:
-    # 6 execuções por dia (horários BRT)
+    # 6 execuções por dia (UTC → BRT = UTC-3). O GitHub costuma atrasar crons;
+    # a lógica de e-mail não depende do horário exato.
     - cron: "8 10 * * *"   # 07:08 BRT
     - cron: "8 13 * * *"   # 10:08 BRT
     - cron: "8 16 * * *"   # 13:08 BRT
     - cron: "8 19 * * *"   # 16:08 BRT
     - cron: "8 22 * * *"   # 19:08 BRT
     - cron: "8 1 * * *"    # 22:08 BRT
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      comando:
+        description: "run = execução normal | inspect = lista artCategory/artType reais da data | test-email = testa o SMTP"
+        type: choice
+        default: run
+        options: [run, inspect, test-email]
+      data:
+        description: "Data alvo YYYY-MM-DD (vazio = hoje). Em 'run' a janela é D-lookback..D0"
+        required: false
+        default: ""
+      sem_email:
+        description: "run: não enviar e-mail (achados ficam pendentes no banco)"
+        type: boolean
+        default: false
+      forcar:
+        description: "run: reprocessar arquivos já vistos"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+# Serializa com o backfill: os dois gravam o mesmo banco no branch 'data'.
+concurrency:
+  group: clipping-db
+  cancel-in-progress: false
+
 jobs:
-  run:
+  clipping:
     runs-on: ubuntu-latest
-    concurrency:
-      group: clipping-db
-      cancel-in-progress: false
-
+    timeout-minutes: 25
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
+          python-version: "3.12"
+          cache: pip
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+      - name: Restaurar banco do branch 'data'
+        run: bash scripts/restore_db.sh
 
-      - name: Restore database from branch 'data'
-        run: |
-          mkdir -p data
-          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
-            git fetch origin data
-            git show origin/data:data/clipping.sqlite > data/clipping.sqlite 2>/dev/null || echo "No DB yet"
-            if [ -f data/clipping.sqlite ]; then
-              echo "✓ Database restored"
-              ls -lh data/clipping.sqlite
-            fi
-          fi
-
-      - name: Run clipping
+      - name: Executar
         env:
           INLABS_EMAIL: ${{ secrets.INLABS_EMAIL }}
           INLABS_PASSWORD: ${{ secrets.INLABS_PASSWORD }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          COMANDO: ${{ inputs.comando || 'run' }}
+          DATA: ${{ inputs.data }}
+          SEM_EMAIL: ${{ inputs.sem_email == true && '1' || '' }}
+          FORCAR: ${{ inputs.forcar == true && '1' || '' }}
         run: |
-          python clip.py --config config.yml run
+          case "$COMANDO" in
+            run)        python clip.py run ${DATA:+--date "$DATA"} ${SEM_EMAIL:+--no-email} ${FORCAR:+--force} ;;
+            inspect)    python clip.py inspect ${DATA:+--date "$DATA"} ;;
+            test-email) python clip.py test-email ;;
+            *)          echo "comando desconhecido: $COMANDO"; exit 2 ;;
+          esac
 
-      - name: Persist database to branch 'data'
-        run: |
-          if [ ! -f data/clipping.sqlite ]; then
-            echo "✗ Database not found!"
-            exit 1
-          fi
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Salva DB temporariamente
-          cp data/clipping.sqlite /tmp/clipping.sqlite
-          
-          # Limpa referências locais para evitar conflito
-          git branch -D data 2>/dev/null || true
-          
-          # Checkout/cria branch data
-          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
-            git fetch origin data:refs/remotes/origin/data
-            git checkout -b data origin/data
-          else
-            git checkout --orphan data
-            git rm -rf . >/dev/null 2>&1 || true
-          fi
-          
-          mkdir -p data
-          mv /tmp/clipping.sqlite data/clipping.sqlite
-          
-          git add data/clipping.sqlite
-          git commit -m "Update database [$(date -u +%Y-%m-%dT%H:%M:%SZ)]" || echo "No changes"
-          git push -u origin data
-          
-          echo "✓ Database persisted"
+      - name: Persistir banco no branch 'data'
+        if: always()
+        run: bash scripts/persist_db.sh

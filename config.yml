@@ -1,78 +1,86 @@
 # Clipping DOU - ANTT/SUFER
+#
+# Credenciais vêm dos GitHub Secrets (INLABS_EMAIL, INLABS_PASSWORD, SMTP_USER,
+# SMTP_PASS). Os campos abaixo só servem para execução local.
 
 inlabs:
-  email: ""     # vazio = usa Secret INLABS_EMAIL
-  password: ""  # vazio = usa Secret INLABS_PASSWORD
+  email: ""
+  password: ""
 
-lookback_days: 2
+# Janela de revarredura a cada execução: D-lookback_days ... D0.
+# Edições extras podem aparecer com atraso e o INLABS pode ficar dias fora do ar;
+# arquivos já processados não são baixados de novo (extras são re-checadas por
+# tamanho), então uma janela maior custa só algumas listagens a mais.
+lookback_days: 5
+
+# E-mail "sem novidades" na primeira execução bem-sucedida de cada dia útil.
+confirmacao_diaria: true
+
+# Alerta por e-mail se o INLABS ficar inacessível por mais de N horas
+# (no máximo 1 alerta por dia).
+alerta_indisponibilidade_horas: 24
 
 # ============================================================================
 # FILTROS
 #
-# orgao      → substring de artCategory (hierarquia do DOU)
-# art_types  → lista de artType exato; vazio = todos os tipos do órgão
+# Cada <article> do XML do INLABS traz:
+#   artCategory → hierarquia do órgão, ex.:
+#     "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
+#   artType     → tipo do ato, ex.: "Portaria", "Deliberação", "Instrução Normativa", "Retificação", "Despacho"
 #
-# Hierarquia no DOU:
-#   "Ministério dos Transportes"
-#     └─ "Agência Nacional de Transportes Terrestres"  (artCategory contém só isso → publ. da ANTT/Diretoria)
-#          └─ "Superintendência de Transporte Ferroviário"  (artCategory contém isso → publicações da SUFER)
-#          └─ "Diretoria Colegiada"                         (artCategory contém isso → deliberações, etc.)
+#   orgao      → substring de artCategory (sem distinção de acentos/maiúsculas)
+#   art_types  → lista de artType aceitos; vazia = todos os tipos do órgão
 #
-# Para pegar TUDO da SUFER, use orgao = "Superintendência de Transporte Ferroviário"
-# Para pegar Deliberações da Diretoria, use orgao = "Diretoria Colegiada"
+# Uma publicação pode casar com mais de um filtro (ex.: Portaria da SUFER casa
+# com SUFER-Todas e ANTT-Portarias); ela aparece uma única vez no e-mail, com
+# os nomes dos filtros.
+#
+# Para validar contra dados reais: Actions → Clipping Diário → Run workflow →
+# comando "inspect" (lista os artCategory/artType do dia e o que cada filtro pega).
 # ============================================================================
 
 filtros:
 
-  # Tudo que a SUFER publicar, qualquer artType
   - nome: "SUFER-Todas"
     secao: "DO1"
     orgao: "Superintendência de Transporte Ferroviário"
     art_types: []
 
-  # Deliberações da Diretoria Colegiada
   - nome: "ANTT-Deliberacoes"
     secao: "DO1"
     orgao: "Diretoria Colegiada"
     art_types: ["Deliberação"]
 
-  # Portarias (qualquer unidade da ANTT)
   - nome: "ANTT-Portarias"
     secao: "DO1"
     orgao: "Agência Nacional de Transportes Terrestres"
     art_types: ["Portaria"]
 
-  # Instruções Normativas
   - nome: "ANTT-Instrucoes"
     secao: "DO1"
     orgao: "Agência Nacional de Transportes Terrestres"
     art_types: ["Instrução Normativa"]
 
-  # Retificações
   - nome: "ANTT-Retificacoes"
     secao: "DO1"
     orgao: "Agência Nacional de Transportes Terrestres"
     art_types: ["Retificação"]
 
-  # ── Exemplos (descomente para ativar) ──────────────────────────────────────
-
-  # Tudo do Ministério dos Transportes (ministro, DG, etc.)
+  # Exemplos (descomente para ativar):
+  # - nome: "ANTT-Resolucoes"
+  #   secao: "DO1"
+  #   orgao: "Agência Nacional de Transportes Terrestres"
+  #   art_types: ["Resolução"]
   # - nome: "MinTransportes-Todas"
   #   secao: "DO1"
   #   orgao: "Ministério dos Transportes"
   #   art_types: []
 
-  # Resoluções da ANTT
-  # - nome: "ANTT-Resolucoes"
-  #   secao: "DO1"
-  #   orgao: "Agência Nacional de Transportes Terrestres"
-  #   art_types: ["Resolução"]
-
 mail:
   smtp_host: "smtp.gmail.com"
   smtp_port: 587
-  smtp_user: ""  # vazio = usa Secret SMTP_USER
-  smtp_pass: ""  # vazio = usa Secret SMTP_PASS
+  smtp_user: ""
+  smtp_pass: ""
   from_email: "guilherme.artintel@gmail.com"
   to_emails:
     - "guiroca@gmail.com"

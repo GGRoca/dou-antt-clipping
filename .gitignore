@@ -1,30 +1,21 @@
-# Database
-data/*.sqlite
-data/*.sqlite-*
+# Banco (vive no branch 'data')
+data/
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
+.pytest_cache/
 venv/
-env/
-ENV/
+.venv/
 
-# IDE
+# IDE / SO
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Debug/test files
+# Arquivos de depuração local
 debug_*
-test_*
 downloaded_*
+*.zip
 *.log
