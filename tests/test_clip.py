@@ -686,3 +686,17 @@ def test_inspect_reports_editions_and_filter_hits(tmp_path, inlabs, monkeypatch,
     assert "outros: ['2026_09_16_ASSINADO_do1_extra_A.pdf']" in out
     assert "SUFER-Todas: 1" in out and "ANTT-Portarias: 2" in out and "ANTT-Deliberacoes: 1" in out
     assert "2026-09-15 DO1 [Deliberação] DELIBERAÇÃO Nº 300" in out
+
+
+def test_invalid_date_gives_clear_message(tmp_path, capsys):
+    y = tmp_path / "c.yml"
+    y.write_text("""
+inlabs: {email: e, password: p}
+filtros: [{nome: A, secao: DO1, orgao: X, art_types: []}]
+mail: {smtp_host: h, smtp_port: 1, from_email: a@b, to_emails: [c@d]}
+storage: {db_path: x.sqlite}
+""", encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        clip.main(["--config", str(y), "inspect", "--date", "2026-09-196"])
+    assert "Data invalida: '2026-09-196'" in str(e.value)
+    assert clip.parse_date("") == clip.today_brt() and clip.parse_date(" 2026-09-16 ") == date(2026, 9, 16)

@@ -1023,6 +1023,16 @@ def cmd_test_email(cfg: Config) -> int:
     return 0
 
 
+def parse_date(s: Optional[str]) -> date:
+    """YYYY-MM-DD; vazio = hoje (BRT). Entrada invalida = mensagem clara, exit 2."""
+    if not s or not s.strip():
+        return today_brt()
+    try:
+        return date.fromisoformat(s.strip())
+    except ValueError:
+        raise SystemExit(f"Data invalida: {s!r} -- use o formato YYYY-MM-DD (ex.: 2026-09-16)")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Clipping DOU -- ANTT/SUFER via INLABS")
     ap.add_argument("--config", default="config.yml")
@@ -1047,13 +1057,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     if a.cmd == "run":
-        d = date.fromisoformat(a.date) if a.date else today_brt()
-        return cmd_run(cfg, d, not a.no_email, a.force)
+        return cmd_run(cfg, parse_date(a.date), not a.no_email, a.force)
     if a.cmd == "backfill":
-        return cmd_backfill(cfg, date.fromisoformat(a.start), date.fromisoformat(a.end))
+        return cmd_backfill(cfg, parse_date(a.start), parse_date(a.end))
     if a.cmd == "inspect":
-        return cmd_inspect(cfg, date.fromisoformat(a.date) if a.date else today_brt(),
-                           a.grep, max(1, a.days))
+        return cmd_inspect(cfg, parse_date(a.date), a.grep, max(1, a.days))
     if a.cmd == "test-email":
         return cmd_test_email(cfg)
     return 2

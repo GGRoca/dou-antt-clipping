@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # Grava data/clipping.sqlite no branch 'data' usando um worktree separado
-# (nao mexe no checkout principal). Idempotente: sem mudanca, sem commit.
+# (nao mexe no checkout principal). Idempotente: sem mudanca, sem commit
+# e sem acesso a rede.
 set -euo pipefail
 DB=data/clipping.sqlite
 if [ ! -f "$DB" ]; then
   echo "Sem $DB para persistir"; exit 0
 fi
+if [ -f "$DB.restored" ] && cmp -s "$DB" "$DB.restored"; then
+  echo "Banco sem alteracoes (identico ao restaurado)"; exit 0
+fi
 
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-set +e
-git ls-remote --exit-code --heads origin data >/dev/null 2>&1
-rc=$?
-set -e
+rc=1
+for i in 1 2 3; do
+  set +e
+  out=$(git ls-remote --exit-code --heads origin data 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then break; fi
+  echo "git ls-remote falhou (rc=$rc), tentativa $i/3: $out"
+  sleep $((i * 5))
+done
 WT=$(mktemp -d)
 case $rc in
   0) git fetch --quiet origin data
@@ -21,7 +31,7 @@ case $rc in
   2) git worktree add --quiet --detach "$WT"
      git -C "$WT" checkout --quiet --orphan data
      git -C "$WT" rm -rfq . 2>/dev/null || true ;;
-  *) echo "Nao foi possivel consultar o remoto (git ls-remote rc=$rc)"; exit 1 ;;
+  *) echo "Nao foi possivel consultar o remoto apos 3 tentativas"; exit 1 ;;
 esac
 
 mkdir -p "$WT/data"
