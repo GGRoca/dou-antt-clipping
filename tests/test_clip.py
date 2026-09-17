@@ -700,3 +700,24 @@ storage: {db_path: x.sqlite}
         clip.main(["--config", str(y), "inspect", "--date", "2026-09-196"])
     assert "Data invalida: '2026-09-196'" in str(e.value)
     assert clip.parse_date("") == clip.today_brt() and clip.parse_date(" 2026-09-16 ") == date(2026, 9, 16)
+
+
+def test_empty_extra_zip_does_not_hide_weekend_pdf(tmp_path, inlabs, mailer, monkeypatch):
+    """Domingo 30/08/2026 real: DO1E.zip vazio (0 articles) ao lado de do1_extra_C.pdf."""
+    freeze_today(monkeypatch, date(2026, 8, 31))
+    inlabs.files[("2026-08-30", "2026-08-30-DO1E.zip")] = make_zip()          # ZIP sem XML
+    inlabs.files[("2026-08-30", "2026_08_30_ASSINADO_do1_extra_C.pdf")] = b"%PDF ANTT"
+    monkeypatch.setattr(clip, "pdf_alert",
+                        lambda data, name, d, filtros: clip.Publication(
+                            article_id=f"pdf:{name}", source_file=name, edition_date=d,
+                            identifica="EDICAO EM PDF -- CONFERIR", texto="x", kind="pdf_alert",
+                            art_type="Edicao em PDF") if b"ANTT" in data else None)
+    cfg = make_config(tmp_path)
+    assert clip.cmd_run(cfg, date(2026, 8, 31), True, False) == 0
+    assert len(mailer["m"].sent) == 1 and "extra_C" in mailer["m"].sent[0][1]
+    db = clip.Storage(cfg.db_path)
+    assert db.file_processed("2026-08-30-DO1E.zip") and db.file_articles("2026-08-30-DO1E.zip") == 0
+    # ZIP regenerado com conteudo: reprocessa; o PDF ja processado nao volta
+    inlabs.files[("2026-08-30", "2026-08-30-DO1E.zip")] = make_zip(DESPACHO_SUFER)
+    clip.cmd_run(cfg, date(2026, 8, 31), True, False)
+    assert len(mailer["m"].sent) == 1 and "Defiro o pedido" in mailer["m"].sent[0][1]

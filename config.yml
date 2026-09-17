@@ -26,7 +26,16 @@ alerta_indisponibilidade_horas: 24
 # Cada <article> do XML do INLABS traz:
 #   artCategory → hierarquia do órgão, ex.:
 #     "Ministério dos Transportes/Agência Nacional de Transportes Terrestres/Superintendência de Transporte Ferroviário"
-#   artType     → tipo do ato, ex.: "Portaria", "Deliberação", "Instrução Normativa", "Retificação", "Despacho"
+#   artType     → tipo do ato, ex.: "Portaria", "Deliberação", "Resolução", "Retificação", "Decisão"
+#
+# Unidades da ANTT vistas em artCategory (inspect de 28/08 a 16/09/2026) e seus tipos:
+#   Diretoria Colegiada ............................ Deliberação, Resolução, Retificação
+#   Gabinete do Diretor-Geral ...................... Portaria, Retificação
+#   Superintendência de Transporte Ferroviário ..... Decisão
+#   Superintendência de Infraestrutura Rodoviária .. Decisão (muitas), Portaria, Retificação
+#   Sup. de Serviços de Transp. Rod. de Passageiros  Decisão (muitas), Retificação
+#   Sup. de Serviços de Transp. Rod. e Multimodal de Cargas .. Decisão, Portaria
+#   Sup. de Fiscalização de Serviços de Transp. Rod. ......... Decisão
 #
 #   orgao      → substring de artCategory (sem distinção de acentos/maiúsculas)
 #   art_types  → lista de artType aceitos; vazia = todos os tipos do órgão
@@ -66,11 +75,13 @@ filtros:
     orgao: "Agência Nacional de Transportes Terrestres"
     art_types: ["Retificação"]
 
+  # Resoluções (atos normativos da Diretoria Colegiada)
+  - nome: "ANTT-Resolucoes"
+    secao: "DO1"
+    orgao: "Agência Nacional de Transportes Terrestres"
+    art_types: ["Resolução"]
+
   # Exemplos (descomente para ativar):
-  # - nome: "ANTT-Resolucoes"
-  #   secao: "DO1"
-  #   orgao: "Agência Nacional de Transportes Terrestres"
-  #   art_types: ["Resolução"]
   # - nome: "MinTransportes-Todas"
   #   secao: "DO1"
   #   orgao: "Ministério dos Transportes"

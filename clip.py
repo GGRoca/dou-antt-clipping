@@ -245,6 +245,11 @@ class Storage:
             "SELECT size FROM processed_files WHERE file_name=?", (name,)).fetchone()
         return row["size"] if row else None
 
+    def file_articles(self, name: str) -> int:
+        row = self.con.execute(
+            "SELECT articles FROM processed_files WHERE file_name=?", (name,)).fetchone()
+        return int(row["articles"]) if row else 0
+
     def mark_file(self, name: str, edition_date: date, articles: int, matched: int,
                   size: int = 0) -> None:
         self.con.execute(
@@ -727,20 +732,21 @@ def is_extra_zip(name: str) -> bool:
     return re.fullmatch(r"\d{4}-\d{2}-\d{2}-DO\d[A-Z]\.zip", name, re.I) is not None
 
 
-def select_candidates(names: List[str], d: date, secao: str) -> List[str]:
-    """ZIPs da secao/data + PDFs apenas quando a edicao correspondente nao tem ZIP.
-    Extras de fim de semana costumam sair so em PDF; a edicao base sem ZIP so conta
-    a partir do dia seguinte (o XML pode aparecer horas depois do PDF)."""
+def select_pdfs(names: List[str], d: date, secao: str, zip_has_content) -> List[str]:
+    """PDFs a processar: apenas quando a edicao correspondente nao tem ZIP com
+    conteudo. Extras de fim de semana costumam sair so em PDF -- as vezes ao lado
+    de um DO1E.zip vazio (0 articles). A edicao base sem ZIP so conta a partir do
+    dia seguinte (o XML pode aparecer horas depois do PDF)."""
     zips = [n for n in names if zip_edition_key(n) == (d.isoformat(), secao)]
     pdfs = [n for n in names if pdf_edition_key(n) == (d.isoformat(), secao)]
-    has_base_zip = any(not is_extra_zip(n) for n in zips)
-    has_extra_zip = any(is_extra_zip(n) for n in zips)
-    out = list(zips)
+    base_ok = any(not is_extra_zip(n) and zip_has_content(n) for n in zips)
+    extra_ok = any(is_extra_zip(n) and zip_has_content(n) for n in zips)
+    out = []
     for n in pdfs:
         if "extra" in n.lower():
-            if not has_extra_zip:
+            if not extra_ok:
                 out.append(n)
-        elif not has_base_zip and d < today_brt():
+        elif not base_ok and d < today_brt():
             out.append(n)
     return out
 
@@ -779,11 +785,13 @@ def process_date(client: InlabsClient, db: Storage, cfg: Config, d: date,
     log(f"  {d.isoformat()}: {len(names)} arquivo(s) no INLABS")
     for secao in cfg.secoes:
         filtros = [f for f in cfg.filtros if f.secao == secao]
-        for name in select_candidates(names, d, secao):
+        zips = [n for n in names if zip_edition_key(n) == (d.isoformat(), secao)]
+        # 1) ZIPs primeiro; so depois decide sobre PDFs, com base no que os ZIPs continham
+        for name in zips:
             data: Optional[bytes] = None
             if db.file_processed(name) and not force:
-                # ZIP de edicao extra pode ser regenerado com uma nova extra do dia:
-                # baixa de novo e reprocessa so se o tamanho mudou (dedup por article_id).
+                # O DO1E.zip e acumulativo: o INLABS o regenera a cada nova extra do dia.
+                # Baixa de novo e reprocessa so se o tamanho mudou (dedup por article_id).
                 if not is_extra_zip(name):
                     continue
                 data = client.download(d, name)
@@ -792,15 +800,25 @@ def process_date(client: InlabsClient, db: Storage, cfg: Config, d: date,
                 log(f"    {name}: tamanho mudou ({db.file_size(name)} -> {len(data)}) -- reprocessando")
             else:
                 log(f"    baixando {name}...")
-            try:
-                process_file(client, db, filtros, d, name, stats, emailed_ts, data)
-            except InlabsUnavailable:
-                raise
-            except Exception as e:   # ZIP/XML/PDF invalido: registra e segue para o proximo
-                msg = f"{name}: {type(e).__name__}: {str(e)[:200]}"
-                stats.errors.append(msg)
-                log(f"    ERRO {msg}")
-                traceback.print_exc()
+            _process_safely(client, db, filtros, d, name, stats, emailed_ts, data)
+        # 2) PDFs apenas para edicoes sem ZIP com conteudo (fins de semana)
+        for name in select_pdfs(names, d, secao, lambda n: db.file_articles(n) > 0):
+            if db.file_processed(name) and not force:
+                continue
+            log(f"    baixando {name}...")
+            _process_safely(client, db, filtros, d, name, stats, emailed_ts, None)
+
+
+def _process_safely(client, db, filtros, d, name, stats, emailed_ts, data) -> None:
+    try:
+        process_file(client, db, filtros, d, name, stats, emailed_ts, data)
+    except InlabsUnavailable:
+        raise
+    except Exception as e:   # ZIP/XML/PDF invalido: registra e segue para o proximo
+        msg = f"{name}: {type(e).__name__}: {str(e)[:200]}"
+        stats.errors.append(msg)
+        log(f"    ERRO {msg}")
+        traceback.print_exc()
 
 
 EMAIL_MAX_ROWS = 25          # publicacoes por e-mail
