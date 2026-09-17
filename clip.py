@@ -971,18 +971,33 @@ def cmd_backfill(cfg: Config, start: date, end: date) -> int:
     return 0 if status == "ok" else 1
 
 
-def cmd_inspect(cfg: Config, d: date, grep: str) -> int:
-    """Diagnostico: mostra artCategory/artType reais e o que cada filtro pegaria."""
+def cmd_inspect(cfg: Config, d: date, grep: str, days: int = 1) -> int:
+    """Diagnostico: artCategory/artType reais e o que cada filtro pegaria, em
+    `days` dias terminando em `d`. Mostra tambem as edicoes (editionNumber)
+    contidas em cada ZIP, para conferir se um DO1E.zip cobre todas as extras."""
     client = InlabsClient(cfg.inlabs_email, cfg.inlabs_password)
     client.login()
-    names = client.list_files(d)
-    log(f"\nArquivos em {d}: {names}")
     pubs: List[Publication] = []
-    for n in names:
-        if zip_edition_key(n):
-            data = client.download(d, n)
-            if data:
-                pubs.extend(parse_zip(data, n, d))
+    for i in range(days - 1, -1, -1):
+        day = d - timedelta(days=i)
+        names = client.list_files(day)
+        zips = [n for n in names if zip_edition_key(n) and zip_edition_key(n)[1] in cfg.secoes]
+        others = [n for n in names if n not in zips]
+        log(f"\n{day}: {len(names)} arquivo(s) | zips das secoes monitoradas: {zips}")
+        if others:
+            log(f"    outros: {others}")
+        for n in zips:
+            data = client.download(day, n)
+            if not data:
+                continue
+            day_pubs = parse_zip(data, n, day)
+            editions: Dict[Tuple[str, str], int] = {}
+            for p in day_pubs:
+                k = (p.pub_name, p.edition_number)
+                editions[k] = editions.get(k, 0) + 1
+            log(f"    {n}: edicoes (pubName, editionNumber): "
+                + ", ".join(f"{pn}/{en}={c}" for (pn, en), c in sorted(editions.items())))
+            pubs.extend(day_pubs)
     key = norm(grep)
     sel = [p for p in pubs if key in norm(p.art_category)]
     log(f"\n{len(pubs)} article(s) no total; {len(sel)} com '{grep}' em artCategory\n")
@@ -996,7 +1011,7 @@ def cmd_inspect(cfg: Config, d: date, grep: str) -> int:
         hits = [p for p in pubs if not p.is_fragment and f.aceita(p.art_category, p.art_type)]
         log(f"\n  {f.nome}: {len(hits)}")
         for p in hits:
-            log(f"     - [{p.art_type}] {p.identifica[:90]}  (p.{p.number_page})")
+            log(f"     - {p.edition_date} {p.pub_name} [{p.art_type}] {p.identifica[:90]}  (p.{p.number_page})")
     return 0
 
 
@@ -1024,6 +1039,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p = sub.add_parser("inspect", help="lista artCategory/artType reais de uma data")
     p.add_argument("--date", help="YYYY-MM-DD (padrao: hoje BRT)")
+    p.add_argument("--days", type=int, default=1, help="quantos dias ate --date (padrao 1)")
     p.add_argument("--grep", default="Transportes", help="substring de artCategory")
 
     sub.add_parser("test-email", help="envia um e-mail de teste")
@@ -1036,7 +1052,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "backfill":
         return cmd_backfill(cfg, date.fromisoformat(a.start), date.fromisoformat(a.end))
     if a.cmd == "inspect":
-        return cmd_inspect(cfg, date.fromisoformat(a.date) if a.date else today_brt(), a.grep)
+        return cmd_inspect(cfg, date.fromisoformat(a.date) if a.date else today_brt(),
+                           a.grep, max(1, a.days))
     if a.cmd == "test-email":
         return cmd_test_email(cfg)
     return 2

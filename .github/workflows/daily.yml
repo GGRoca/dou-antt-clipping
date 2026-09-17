@@ -21,6 +21,10 @@ on:
         description: "Data alvo YYYY-MM-DD (vazio = hoje). Em 'run' a janela é D-lookback..D0"
         required: false
         default: ""
+      dias:
+        description: "inspect: quantos dias até a data (ex.: 20 = últimos 20 dias)"
+        required: false
+        default: "1"
       sem_email:
         description: "run: não enviar e-mail (achados ficam pendentes no banco)"
         type: boolean
@@ -64,12 +68,13 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           COMANDO: ${{ inputs.comando || 'run' }}
           DATA: ${{ inputs.data }}
+          DIAS: ${{ inputs.dias || '1' }}
           SEM_EMAIL: ${{ inputs.sem_email == true && '1' || '' }}
           FORCAR: ${{ inputs.forcar == true && '1' || '' }}
         run: |
           case "$COMANDO" in
             run)        python clip.py run ${DATA:+--date "$DATA"} ${SEM_EMAIL:+--no-email} ${FORCAR:+--force} ;;
-            inspect)    python clip.py inspect ${DATA:+--date "$DATA"} ;;
+            inspect)    python clip.py inspect ${DATA:+--date "$DATA"} --days "$DIAS" ;;
             test-email) python clip.py test-email ;;
             *)          echo "comando desconhecido: $COMANDO"; exit 2 ;;
           esac

@@ -671,3 +671,18 @@ storage: {db_path: data/x.sqlite}
     assert cfg.inlabs_email == "e@e" and cfg.smtp_pass == "sp" and cfg.lookback_days == 1
     assert [f.nome for f in cfg.filtros] == ["A", "B"] and cfg.filtros[1].art_types == ["Deliberação"]
     assert cfg.secoes == ["DO1"] and cfg.alerta_indisponibilidade_horas == 24
+
+
+def test_inspect_reports_editions_and_filter_hits(tmp_path, inlabs, monkeypatch, capsys):
+    inlabs.files[("2026-09-15", "2026-09-15-DO1.zip")] = make_zip(DELIBERACAO, OUTRO_ORGAO)
+    inlabs.files[("2026-09-16", "2026-09-16-DO1E.zip")] = make_zip(
+        article_xml("7001", "Portaria", SUFER, "PORTARIA Nº 1", "<p>a</p>", pub_name="DO1E", edition="176-A"),
+        article_xml("7002", "Portaria", ANTT, "PORTARIA Nº 2", "<p>b</p>", pub_name="DO1E", edition="176-B"))
+    inlabs.files[("2026-09-16", "2026_09_16_ASSINADO_do1_extra_A.pdf")] = b"%PDF"
+    cfg = make_config(tmp_path)
+    assert clip.cmd_inspect(cfg, date(2026, 9, 16), "Transportes", days=2) == 0
+    out = capsys.readouterr().out
+    assert "2026-09-16-DO1E.zip: edicoes (pubName, editionNumber): DO1E/176-A=1, DO1E/176-B=1" in out
+    assert "outros: ['2026_09_16_ASSINADO_do1_extra_A.pdf']" in out
+    assert "SUFER-Todas: 1" in out and "ANTT-Portarias: 2" in out and "ANTT-Deliberacoes: 1" in out
+    assert "2026-09-15 DO1 [Deliberação] DELIBERAÇÃO Nº 300" in out
