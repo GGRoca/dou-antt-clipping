@@ -365,6 +365,13 @@ class InlabsClient:
         if not self.session.cookies.get(self.COOKIE):
             if self._is_maintenance(r):
                 raise InlabsUnavailable("INLABS em manutencao (pagina de aviso no login).")
+            # Credencial errada responde 200 sem cookie. Qualquer outro status
+            # (404 durante a manutencao de out/2026, 403, redirect) e o site
+            # fora do ar ou com endpoint trocado: transitorio, nao erro de senha.
+            if r.status_code != 200:
+                raise InlabsUnavailable(
+                    f"Login respondeu HTTP {r.status_code} em {self.LOGIN_URL} "
+                    "(INLABS fora do ar ou endpoint de login alterado).")
             raise InlabsAuthError(
                 f"Login respondeu HTTP {r.status_code} sem cookie {self.COOKIE}. "
                 "Verifique INLABS_EMAIL / INLABS_PASSWORD nos GitHub Secrets.")

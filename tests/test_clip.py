@@ -268,6 +268,7 @@ class FakeInlabs:
         self.expire_sessions = False
         self.requests = []
         self.valid = ("u@x", "p")
+        self.login_404 = False       # out/2026: /logar.php sumiu durante a manutencao
 
     def start(self):
         srv = self
@@ -294,6 +295,8 @@ class FakeInlabs:
                 if srv.fail_next:
                     srv.fail_next -= 1
                     self._send(503, b"<html>Manutencao programada</html>"); return
+                if srv.login_404:
+                    self._send(404, b"<html><h1>Not Found</h1></html>"); return
                 if (form.get("email", [""])[0], form.get("password", [""])[0]) == srv.valid:
                     srv.expire_sessions = False
                     self._send(200, b"<html>Bem-vindo <a href='sair.php'>Sair</a></html>",
@@ -382,6 +385,15 @@ def test_client_login_list_download(inlabs):
 def test_client_wrong_password_is_explicit_auth_error(inlabs):
     c = clip.InlabsClient("u@x", "errada")
     with pytest.raises(clip.InlabsAuthError):
+        c.login()
+
+
+def test_client_login_404_is_unavailable_not_auth_error(inlabs):
+    # 21/10/2026: INLABS em manutencao, POST /logar.php passou a responder 404
+    # sem texto de manutencao. Nao e senha errada: deve ser transitorio.
+    inlabs.login_404 = True
+    c = clip.InlabsClient("u@x", "p")
+    with pytest.raises(clip.InlabsUnavailable):
         c.login()
 
 
