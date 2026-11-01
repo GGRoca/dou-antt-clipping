@@ -15,6 +15,11 @@ Pipeline por execucao:
   6. edicoes extras publicadas apenas em PDF geram um alerta para conferencia
      manual (o texto do PDF nao e recortado)
 
+Fallback: se o INLABS estiver indisponivel, a mesma janela e consultada no indice
+publico do portal (www.in.gov.br/leiturajornal) e o texto de cada ato filtrado e
+lido da pagina do ato. Achados do portal ficam com file_name 'portal:...' e o
+e-mail indica a fonte. O mesmo ato vindo das duas fontes nao e duplicado.
+
 Politica de e-mail:
   - achados: imediato, em qualquer execucao
   - "sem novidades": na primeira execucao bem-sucedida de cada dia util (BRT)
@@ -26,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html as html_lib
+import json
 import os
 import re
 import smtplib
@@ -52,6 +58,7 @@ BRT = ZoneInfo("America/Sao_Paulo")
 INLABS_BASE = "https://inlabs.in.gov.br"
 # Header enviado pelo script oficial da Imprensa Nacional ("script" em hex)
 INLABS_ORIGEM = "736372697074"
+PORTAL_BASE = "https://www.in.gov.br"
 
 # artType de fragmentos (anexos/quadros/tabelas) que nao sao atos por si so.
 FRAGMENT_TYPES = {"anexo", "quadro", "tabela"}
@@ -78,6 +85,11 @@ def norm(text: str) -> str:
     text = unicodedata.normalize("NFKD", text or "")
     text = text.encode("ascii", "ignore").decode()
     return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def act_key(edition_number: str, number_page: str, art_type: str, identifica: str) -> Tuple[str, ...]:
+    """Identidade de um ato independente da fonte (INLABS ou portal), dentro da data."""
+    return tuple(norm(x) for x in (edition_number, number_page, art_type, identifica))
 
 
 # ============================================================================
@@ -164,7 +176,7 @@ CREATE TABLE IF NOT EXISTS runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     run_ts          TEXT NOT NULL,
     run_date        TEXT NOT NULL,
-    status          TEXT NOT NULL,          -- ok | inlabs_unavailable | error
+    status          TEXT NOT NULL,          -- ok | portal | inlabs_unavailable | portal_unavailable | error
     files_processed INTEGER NOT NULL DEFAULT 0,
     new_matches     INTEGER NOT NULL DEFAULT 0,
     emails_sent     INTEGER NOT NULL DEFAULT 0,
@@ -258,9 +270,30 @@ class Storage:
         self.con.commit()
 
     # -- matches ---------------------------------------------------------
+    def has_match(self, article_id: str) -> bool:
+        return self.con.execute(
+            "SELECT 1 FROM matches WHERE article_id=?", (article_id,)).fetchone() is not None
+
+    def same_act_other_source(self, p: "Publication") -> bool:
+        """O ato ja foi capturado pela outra fonte (INLABS x portal)? Os ids nao
+        coincidem entre as fontes, entao compara data, edicao, pagina, tipo e
+        Identifica. artCategory fica de fora: o portal as vezes omite a unidade
+        (ex.: Diretoria Colegiada) que o XML do INLABS traz."""
+        portal = p.source_file.startswith("portal:")
+        key = act_key(p.edition_number, p.number_page, p.art_type, p.identifica)
+        rows = self.con.execute(
+            "SELECT file_name, edition_number, number_page, art_type, identifica FROM matches "
+            "WHERE edition_date=? AND kind='article'", (p.edition_date.isoformat(),))
+        return any(
+            r["file_name"].startswith("portal:") != portal
+            and act_key(r["edition_number"], r["number_page"], r["art_type"], r["identifica"]) == key
+            for r in rows)
+
     def add_match(self, m: "Match", emailed_ts: Optional[str] = None) -> bool:
-        """Insere se ainda nao existe. Retorna True se e novo."""
+        """Insere se ainda nao existe (nem pela outra fonte). Retorna True se e novo."""
         p = m.pub
+        if p.kind == "article" and self.same_act_other_source(p):
+            return False
         cur = self.con.execute(
             """INSERT OR IGNORE INTO matches (article_id, file_name, edition_date,
                filter_names, pub_name, art_type, art_category, edition_number,
@@ -533,6 +566,123 @@ def parse_zip(zip_bytes: bytes, source_file: str, edition_date: date) -> List[Pu
 
 
 # ============================================================================
+# FALLBACK: PORTAL in.gov.br (indice "leiturajornal" + pagina de cada ato)
+# ============================================================================
+
+class PortalUnavailable(Exception):
+    """Portal fora do ar (rede, 5xx, HTTP inesperado). Transitorio."""
+
+
+class PortalFormatError(Exception):
+    """O portal respondeu fora do formato conhecido. Erro real, nao transitorio."""
+
+
+_PARAMS_RE = re.compile(r'<script[^>]*\bid="params"[^>]*>(.*?)</script>', re.S | re.I)
+
+
+class PortalClient:
+    """Indice publico do DOU, usado quando o INLABS esta indisponivel.
+
+    leiturajornal?data=DD-MM-AAAA&secao=do1 embute <script id="params"
+    type="application/json"> com typeNormDay (edicoes extras/suplementos do dia) e
+    jsonArray (um item por ato: pubName, editionNumber, numberPage, artType, title,
+    hierarchyStr = artCategory do INLABS, urlTitle; o texto vem truncado). O texto
+    integral esta em /web/dou/-/<urlTitle>, no elemento class="texto-dou", com as
+    mesmas classes do XML do INLABS (identifica, ementa, assina, cargo). Anexos
+    soltos nao aparecem no indice. Verificado em 01/11/2026 (datas de 2022 a 2026)."""
+    INDEX_URL = f"{PORTAL_BASE}/leiturajornal"
+    ACT_URL = f"{PORTAL_BASE}/web/dou/-/"
+    RETRY_WAITS = (0, 10, 30)
+    # Sufixos de typeNormDay consultados alem da edicao base:
+    # E = extras (DO1_EXTRA_A..H), A = suplemento, ESP = especial.
+    VARIANTES = ("E", "A", "ESP")
+
+    def __init__(self, timeout: int = 60):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; dou-antt-clipping/5.1)",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        })
+
+    def _get(self, url: str, **kw) -> requests.Response:
+        last: object = None
+        for i, wait in enumerate(self.RETRY_WAITS, 1):
+            if wait:
+                log(f"    aguardando {wait}s antes da tentativa {i}/{len(self.RETRY_WAITS)}...")
+                time.sleep(wait)
+            try:
+                r = self.session.get(url, timeout=self.timeout, **kw)
+            except requests.RequestException as e:
+                last = e
+                log(f"    portal, rede: {type(e).__name__}: {str(e)[:160]}")
+                continue
+            if r.status_code >= 500:
+                last = f"HTTP {r.status_code} em {url}"
+                log(f"    portal, servidor: HTTP {r.status_code}")
+                continue
+            return r
+        raise PortalUnavailable(
+            f"portal in.gov.br inacessivel apos {len(self.RETRY_WAITS)} tentativas: {last}")
+
+    def index(self, d: date, secao: str) -> Tuple[List[dict], Dict[str, bool]]:
+        """(atos do indice, typeNormDay) de uma secao ('DO1', 'DO1E'...) na data."""
+        what = f"leiturajornal {d.isoformat()} {secao}"
+        r = self._get(self.INDEX_URL, params={"data": d.strftime("%d-%m-%Y"), "secao": secao.lower()})
+        if r.status_code != 200:
+            raise PortalUnavailable(f"{what}: HTTP {r.status_code}")
+        m = _PARAMS_RE.search(r.text)
+        if not m:
+            raise PortalFormatError(f'{what}: pagina sem <script id="params">')
+        try:
+            data = json.loads(m.group(1))
+            return list(data["jsonArray"]), dict(data.get("typeNormDay") or {})
+        except (ValueError, KeyError, TypeError) as e:
+            raise PortalFormatError(f"{what}: JSON fora do formato esperado ({type(e).__name__}: {e})")
+
+    def act_html(self, url_title: str) -> str:
+        """HTML interno do elemento class="texto-dou" da pagina do ato."""
+        r = self._get(self.ACT_URL + url_title)
+        if r.status_code == 404:
+            raise PortalFormatError(f"ato {url_title}: listado no indice, mas a pagina responde 404")
+        if r.status_code != 200:
+            raise PortalUnavailable(f"ato {url_title}: HTTP {r.status_code}")
+        el = BeautifulSoup(r.text, "html.parser").find(class_="texto-dou")
+        if el is None:
+            raise PortalFormatError(f'ato {url_title}: pagina sem class="texto-dou"')
+        return el.decode_contents().strip()
+
+
+def portal_publication(item: dict, d: date, secao: str) -> Publication:
+    """Item do jsonArray -> Publication sem texto (o texto vem de portal_fill_text).
+    Extras saem como 'DO1_EXTRA_A' no portal e como 'DO1E' no INLABS: normaliza."""
+    pub_name = item.get("pubName") or secao
+    if "_EXTRA_" in pub_name.upper():
+        pub_name = f"{secao}E"
+    url_title = item["urlTitle"]
+    return Publication(
+        article_id=f"portal:{url_title}",
+        source_file=f"portal:{d.isoformat()}-{pub_name}",
+        edition_date=d,
+        pub_name=pub_name,
+        art_type=item.get("artType") or "",
+        art_category=item.get("hierarchyStr") or "",
+        edition_number=str(item.get("editionNumber") or ""),
+        number_page=str(item.get("numberPage") or ""),
+        pdf_page=PortalClient.ACT_URL + url_title,
+        identifica=(item.get("title") or "").strip(),
+    )
+
+
+def portal_fill_text(p: Publication, texto_html: str) -> None:
+    p.texto_html = texto_html
+    p.texto = html_to_text(texto_html)
+    p.ementa = _class_text(texto_html, "ementa")
+    p.assina = _class_text(texto_html, "assina")
+    p.cargo = _class_text(texto_html, "cargo")
+
+
+# ============================================================================
 # FILTROS
 # ============================================================================
 
@@ -656,6 +806,8 @@ def render_matches_html(rows: List, prefix: str) -> str:
             meta.append(f"Edicao {r['edition_number']}")
         if r["number_page"]:
             meta.append(f"Pagina {r['number_page']}")
+        if (r["file_name"] or "").startswith("portal:"):
+            meta.append("Fonte: portal in.gov.br")
         link = (f' &nbsp;|&nbsp; <a href="{html_lib.escape(r["pdf_page"])}">Ver no DOU</a>'
                 if r["pdf_page"] else "")
         if r["kind"] == "pdf_alert":
@@ -676,10 +828,18 @@ def render_matches_html(rows: List, prefix: str) -> str:
   <div style="font-size:12px;color:#495057;margin-bottom:12px;">{html_lib.escape(r['art_category'] or '')}</div>
   <div style="font-family:Georgia,serif;font-size:14px;line-height:1.6;color:#212529;">{body}</div>
 </div>""")
+    n_portal = sum(1 for r in rows if (r["file_name"] or "").startswith("portal:"))
+    if n_portal == 0:
+        origem = "Clipping automatico via INLABS."
+    else:
+        origem = ("Clipping automatico via " + ("portal in.gov.br" if n_portal == len(rows)
+                                                 else "INLABS e portal in.gov.br")
+                  + ". O INLABS estava fora do ar: as publicacoes marcadas com "
+                    "'Fonte: portal in.gov.br' vieram do indice publico do DOU.")
     return f"""<html><body style="font-family:Arial,sans-serif;background:#f8f9fa;margin:0;padding:24px;">
 <div style="max-width:880px;margin:0 auto;">
 <h2 style="color:#28a745;font-size:20px;margin:0 0 4px 0;">{html_lib.escape(prefix)} {len(rows)} publicacao(oes)</h2>
-<p style="color:#495057;margin:0 0 20px 0;">Clipping automatico via INLABS.</p>
+<p style="color:#495057;margin:0 0 20px 0;">{origem}</p>
 {''.join(cards)}
 </div></body></html>"""
 
@@ -828,6 +988,47 @@ def _process_safely(client, db, filtros, d, name, stats, emailed_ts, data) -> No
         traceback.print_exc()
 
 
+def process_date_portal(portal: PortalClient, db: Storage, cfg: Config, d: date,
+                        stats: RunStats, emailed_ts: Optional[str] = None) -> None:
+    """Fallback: indice da data no portal -> filtros -> pagina so dos atos que
+    casaram e ainda nao estao no banco (por nenhuma das duas fontes)."""
+    for secao in cfg.secoes:
+        filtros = [f for f in cfg.filtros if f.secao == secao]
+        items, edicoes = portal.index(d, secao)
+        n_base = len(items)
+        for suf in PortalClient.VARIANTES:
+            if edicoes.get(f"{secao}{suf}"):
+                items = items + portal.index(d, f"{secao}{suf}")[0]
+        try:
+            pubs = [portal_publication(it, d, secao) for it in items]
+        except (KeyError, TypeError, AttributeError) as e:
+            raise PortalFormatError(f"leiturajornal {d} {secao}: item sem campo esperado ({e!r})")
+        matches = apply_filters(pubs, filtros)
+        log(f"  {d.isoformat()}: {secao} no portal -- {n_base} ato(s) na edicao base, "
+            f"{len(items) - n_base} em extras/suplementos, {len(matches)} no(s) filtro(s)")
+        new = 0
+        for m in matches:
+            p = m.pub
+            if db.has_match(p.article_id) or db.same_act_other_source(p):
+                continue
+            try:
+                portal_fill_text(p, portal.act_html(p.article_id[len("portal:"):]))
+            except PortalUnavailable:
+                raise
+            except Exception as e:   # pagina do ato fora do formato: registra, volta na proxima
+                msg = f"{p.pdf_page}: {type(e).__name__}: {str(e)[:200]}"
+                stats.errors.append(msg)
+                log(f"    ERRO {msg}")
+                continue
+            if db.add_match(m, emailed_ts):
+                new += 1
+                log(f"    novo: {p.pub_name} p.{p.number_page} [{p.art_type}] {p.identifica[:90]}")
+        if items:
+            db.mark_file(f"portal:{d.isoformat()}-{secao}", d, n_base, len(matches))
+            stats.files += 1
+        stats.new_matches += new
+
+
 EMAIL_MAX_ROWS = 25          # publicacoes por e-mail
 EMAIL_MAX_HTML = 150_000     # chars de texto_html por publicacao
 
@@ -853,7 +1054,8 @@ def send_pending(db: Storage, mailer: Mailer, cfg: Config, stats: RunStats) -> i
     return total
 
 
-def maybe_daily_confirmation(db: Storage, mailer: Mailer, cfg: Config, stats: RunStats) -> None:
+def maybe_daily_confirmation(db: Storage, mailer: Mailer, cfg: Config, stats: RunStats,
+                             fonte: str = "INLABS") -> None:
     """'Sem novidades' 1x por dia util, so depois de a edicao base do dia ter sido
     processada -- ou apos 12h BRT (dia sem edicao, ex. feriado)."""
     hoje = today_brt()
@@ -861,7 +1063,9 @@ def maybe_daily_confirmation(db: Storage, mailer: Mailer, cfg: Config, stats: Ru
         return
     if db.get("last_email_date") == hoje.isoformat():
         return
-    edicao_hoje = [s for s in cfg.secoes if db.file_processed(f"{hoje.isoformat()}-{s}.zip")]
+    edicao_hoje = [s for s in cfg.secoes
+                   if db.file_processed(f"{hoje.isoformat()}-{s}.zip")
+                   or db.file_articles(f"portal:{hoje.isoformat()}-{s}") > 0]
     agora = now_brt()
     if not edicao_hoje and agora.hour < 12:
         log("  Edicao de hoje ainda nao publicada -- confirmacao diaria fica para a proxima execucao")
@@ -874,6 +1078,7 @@ def maybe_daily_confirmation(db: Storage, mailer: Mailer, cfg: Config, stats: Ru
          f"Nenhuma edicao publicada hoje ate {agora:%H:%M} (BRT)."),
         "Ultimas edicoes processadas: " + (", ".join(r["file_name"] for r in files) or "nenhuma"),
         "Filtros: " + ", ".join(f.nome for f in cfg.filtros),
+        f"Fonte desta consulta: {fonte}.",
     ]
     mailer.send(f"{cfg.subject_prefix} {hoje.strftime('%d/%m/%Y')} - sem novidades",
                 render_simple_html("Sem novidades no DOU de hoje", lines))
@@ -881,27 +1086,28 @@ def maybe_daily_confirmation(db: Storage, mailer: Mailer, cfg: Config, stats: Ru
     stats.emails += 1
 
 
-def handle_unavailable(db: Storage, mailer: Optional[Mailer], cfg: Config, err: Exception,
+def handle_unavailable(db: Storage, mailer: Optional[Mailer], cfg: Config, err: object,
                        stats: RunStats) -> None:
     last_ok = db.get("last_success_ts")
     hours = ((now_utc() - datetime.fromisoformat(last_ok)).total_seconds() / 3600
              if last_ok else None)
-    log(f"\nINLABS indisponivel: {err}")
+    log(f"\nDOU indisponivel (INLABS e portal): {err}")
     log(f"Ultimo sucesso: {last_ok or 'nunca'}"
         + (f" ({hours:.1f}h atras)" if hours is not None else ""))
-    stats.notes.append(str(err)[:200])
+    stats.notes.append(str(err)[:400])
     if mailer is None or hours is None or hours < cfg.alerta_indisponibilidade_horas:
         return
     last_alert = db.get("unavailable_alert_ts")
     if last_alert and (now_utc() - datetime.fromisoformat(last_alert)) < timedelta(hours=24):
         return
     mailer.send(
-        f"{cfg.subject_prefix} ALERTA - INLABS inacessivel ha {hours:.0f}h",
+        f"{cfg.subject_prefix} ALERTA - INLABS e portal inacessiveis ha {hours:.0f}h",
         render_simple_html("O clipping nao consegue consultar o DOU", [
             f"Ultima consulta bem-sucedida: {last_ok} (UTC), ha {hours:.0f} horas.",
             f"Erro mais recente: {err}",
             "As execucoes continuam a cada ~3h; este alerta se repete no maximo 1x por dia.",
-            "Se persistir, verifique https://inlabs.in.gov.br manualmente.",
+            "Se persistir, verifique manualmente https://inlabs.in.gov.br e "
+            "https://www.in.gov.br/leiturajornal.",
         ], color="#dc3545"))
     db.set("unavailable_alert_ts", now_utc().isoformat())
     stats.emails += 1
@@ -924,21 +1130,36 @@ def cmd_run(cfg: Config, target: date, send_email: bool, force: bool) -> int:
         stats.errors.append(f"{type(e).__name__}: {str(e)[:300]}")
         traceback.print_exc()
 
-    # 1) consulta ao INLABS
+    def success(fonte: str) -> None:
+        db.set("last_success_ts", now_utc().isoformat())
+        if db.get("unavailable_alert_ts"):
+            db.set("unavailable_alert_ts", None)
+            stats.notes.append(f"consulta voltou apos alerta ({fonte})")
+
+    # 1) consulta ao INLABS; fora do ar -> fallback no portal in.gov.br
     try:
         client = InlabsClient(cfg.inlabs_email, cfg.inlabs_password)
         client.login()
         for d in dates:
             process_date(client, db, cfg, d, stats, force=force)
-        db.set("last_success_ts", now_utc().isoformat())
-        if db.get("unavailable_alert_ts"):
-            db.set("unavailable_alert_ts", None)
-            stats.notes.append("INLABS voltou apos alerta")
+        success("INLABS")
     except InlabsUnavailable as e:
         status = "inlabs_unavailable"
+        log(f"\nINLABS indisponivel: {e}")
+        log("FALLBACK: consultando a mesma janela no indice publico do portal in.gov.br")
         try:
-            handle_unavailable(db, mailer, cfg, e, stats)
-        except Exception as e2:   # SMTP do alerta falhou
+            portal = PortalClient()
+            for d in dates:
+                process_date_portal(portal, db, cfg, d, stats)
+            status = "portal"
+            stats.notes.append(f"fallback portal in.gov.br; INLABS: {str(e)[:200]}")
+            success("portal")
+        except PortalUnavailable as e2:
+            try:
+                handle_unavailable(db, mailer, cfg, f"INLABS: {e} | portal: {e2}", stats)
+            except Exception as e3:   # SMTP do alerta falhou
+                fail(e3)
+        except Exception as e2:   # portal fora do formato conhecido, bug -> erro explicito
             fail(e2)
     except Exception as e:        # credenciais, bug... -> erro explicito
         fail(e)
@@ -949,51 +1170,130 @@ def cmd_run(cfg: Config, target: date, send_email: bool, force: bool) -> int:
             sent = send_pending(db, mailer, cfg, stats)
             if sent:
                 log(f"  {sent} publicacao(oes) enviada(s) por e-mail")
-            if status == "ok" and not stats.errors:
-                maybe_daily_confirmation(db, mailer, cfg, stats)
+            if status in ("ok", "portal") and not stats.errors:
+                maybe_daily_confirmation(db, mailer, cfg, stats, fonte=(
+                    "INLABS" if status == "ok" else
+                    "portal in.gov.br (fallback: INLABS indisponivel nesta execucao)"))
         except Exception as e:    # SMTP: achados continuam pendentes para a proxima
             fail(e)
     else:
         log(f"  {len(db.pending_matches())} match(es) pendente(s) de envio (--no-email)")
 
-    if stats.errors and status == "ok":
+    if stats.errors and status in ("ok", "portal"):
         status = "error"
     db.log_run(target, status, stats.files, stats.new_matches, stats.emails,
                "; ".join(stats.notes + stats.errors))
     db.close()
     log(f"\nStatus: {status} | arquivos: {stats.files} | novos matches: {stats.new_matches} "
         f"| e-mails: {stats.emails}" + (f" | erros: {len(stats.errors)}" if stats.errors else ""))
-    return 0 if status in ("ok", "inlabs_unavailable") else 1
+    return 0 if status in ("ok", "portal", "inlabs_unavailable") else 1
 
 
-def cmd_backfill(cfg: Config, start: date, end: date) -> int:
-    """Popula o banco sem enviar e-mail; matches ficam marcados como 'backfill'."""
+def github_output(**values: object) -> None:
+    """Saidas do passo no GitHub Actions (sem efeito fora dele)."""
+    path = os.getenv("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            for k, v in values.items():
+                fh.write(f"{k}={v}\n")
+
+
+def github_summary(lines: List[str]) -> None:
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+
+def cmd_backfill(cfg: Config, start: Optional[date], end: Optional[date], fonte: str = "portal",
+                 max_minutes: int = 0, enviar: bool = False) -> int:
+    """Popula o banco em lotes retomaveis, sem enviar e-mail.
+
+    fonte: 'portal' (indice publico do DOU; funciona com o INLABS fora do ar e
+    para datas antigas) ou 'inlabs'. Achados ficam marcados como 'backfill' (nunca
+    enviados) ou, com enviar=True, pendentes: saem no proximo e-mail do Clipping
+    Diario -- para repor uma lacuna recente.
+    max_minutes > 0: o lote para depois da data em curso quando o tempo estoura e
+    grava a proxima data em state.backfill_next; start=None retoma dali (e end=None
+    usa o fim do backfill em andamento). Fonte fora do ar ou erro numa data: o lote
+    para nessa data, que volta na retomada."""
     db = Storage(cfg.db_path)
+    retomando = start is None
+    if retomando:
+        nxt = db.get("backfill_next")
+        if not nxt:
+            db.close()
+            raise SystemExit("Nenhum backfill em andamento para retomar: informe a data inicial.")
+        start = date.fromisoformat(nxt)
+    if end is None:
+        end = date.fromisoformat(db.get("backfill_end")) if retomando and db.get("backfill_end") \
+            else today_brt()
+    if start > end:
+        db.close()
+        raise SystemExit(f"Data inicial {start} posterior a data final {end}.")
+    log("=" * 64)
+    log(f"Backfill {start}..{end} | fonte: {fonte} | "
+        f"{'achados pendentes de e-mail' if enviar else 'sem e-mail'}"
+        + (f" | lote de ate {max_minutes} min" if max_minutes else "")
+        + (" | retomada" if retomando else ""))
+    log("=" * 64)
     stats = RunStats()
     status = "ok"
+    emailed_ts = None if enviar else "backfill"
+    t0 = time.monotonic()
+    d = start
+    proximo: Optional[date] = None
     try:
-        client = InlabsClient(cfg.inlabs_email, cfg.inlabs_password)
-        client.login()
-        d = start
+        if fonte == "inlabs":
+            client = InlabsClient(cfg.inlabs_email, cfg.inlabs_password)
+            client.login()
+        else:
+            portal = PortalClient()
         while d <= end:
-            process_date(client, db, cfg, d, stats, emailed_ts="backfill")
+            n_erros = len(stats.errors)
+            if fonte == "inlabs":
+                process_date(client, db, cfg, d, stats, emailed_ts=emailed_ts)
+            else:
+                process_date_portal(portal, db, cfg, d, stats, emailed_ts=emailed_ts)
+            if len(stats.errors) > n_erros:
+                status, proximo = "error", d       # a data com erro volta na retomada
+                break
             d += timedelta(days=1)
-            time.sleep(1)
-    except InlabsUnavailable as e:
-        status = "inlabs_unavailable"
-        log(f"\nINLABS indisponivel: {e} -- backfill interrompido em {d}")
+            if d <= end and max_minutes and time.monotonic() - t0 >= max_minutes * 60:
+                proximo = d
+                break
+            time.sleep(0.5)
+    except (InlabsUnavailable, PortalUnavailable) as e:
+        status = "inlabs_unavailable" if fonte == "inlabs" else "portal_unavailable"
+        proximo = d
+        stats.notes.append(str(e)[:200])
+        log(f"\nFonte indisponivel: {e} -- backfill interrompido em {d}")
     except Exception as e:
-        status = "error"
+        status, proximo = "error", d
         stats.errors.append(f"{type(e).__name__}: {str(e)[:300]}")
         traceback.print_exc()
-    finally:
-        if stats.errors and status == "ok":
-            status = "error"
-        db.log_run(start, status, stats.files, stats.new_matches, 0,
-                   f"backfill {start}..{end}; " + "; ".join(stats.notes + stats.errors))
-        db.close()
-    log(f"\nBackfill: {status} | arquivos: {stats.files} | matches: {stats.new_matches}")
-    return 0 if status == "ok" else 1
+
+    db.set("backfill_next", proximo.isoformat() if proximo else None)
+    db.set("backfill_end", end.isoformat() if proximo else None)
+    ultimo = (proximo or end + timedelta(days=1)) - timedelta(days=1)
+    feito = f"{start}..{ultimo}" if ultimo >= start else "nenhuma data"
+    situacao = "concluido" if proximo is None else ("parcial" if status == "ok" else status)
+    db.log_run(start, status, stats.files, stats.new_matches, 0,
+               f"backfill[{fonte}] {start}..{end}: processado {feito}; "
+               + (f"proximo: {proximo}" if proximo else "concluido")
+               + "".join(f"; {x}" for x in stats.notes + stats.errors))
+    db.close()
+    github_output(next_start=proximo.isoformat() if proximo else "", end=end.isoformat(),
+                  status=situacao)
+    github_summary([
+        f"### Backfill {start} .. {end} (fonte: {fonte})",
+        f"- Situacao: **{situacao}** | processado: {feito} | novos achados: {stats.new_matches}",
+        (f"- Proxima data: {proximo} (rode o workflow com a data inicial em branco para retomar)"
+         if proximo else "- Backfill concluido."),
+    ] + [f"- Erro: {x}" for x in stats.errors])
+    log(f"\nBackfill: {situacao} | processado: {feito} | itens: {stats.files} | "
+        f"novos achados: {stats.new_matches}" + (f" | proxima data: {proximo}" if proximo else ""))
+    return 0 if status in ("ok", "inlabs_unavailable", "portal_unavailable") else 1
 
 
 def cmd_inspect(cfg: Config, d: date, grep: str, days: int = 1) -> int:
@@ -1068,9 +1368,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-email", action="store_true")
     p.add_argument("--force", action="store_true", help="reprocessa arquivos ja vistos")
 
-    p = sub.add_parser("backfill", help="popula o banco sem e-mail")
-    p.add_argument("--start", required=True)
-    p.add_argument("--end", required=True)
+    p = sub.add_parser("backfill", help="popula o banco sem e-mail, em lotes retomaveis")
+    p.add_argument("--start", help="YYYY-MM-DD (omitido = retomar o backfill em andamento)")
+    p.add_argument("--end", help="YYYY-MM-DD (omitido = fim do backfill em andamento, ou hoje)")
+    p.add_argument("--fonte", choices=["portal", "inlabs"], default="portal")
+    p.add_argument("--max-minutes", type=int, default=0,
+                   help="duracao maxima do lote; 0 = sem limite")
+    p.add_argument("--enviar", action="store_true",
+                   help="achados ficam pendentes e saem no proximo e-mail do Clipping Diario")
 
     p = sub.add_parser("inspect", help="lista artCategory/artType reais de uma data")
     p.add_argument("--date", help="YYYY-MM-DD (padrao: hoje BRT)")
@@ -1084,7 +1389,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "run":
         return cmd_run(cfg, parse_date(a.date), not a.no_email, a.force)
     if a.cmd == "backfill":
-        return cmd_backfill(cfg, parse_date(a.start), parse_date(a.end))
+        return cmd_backfill(cfg, parse_date(a.start) if a.start else None,
+                            parse_date(a.end) if a.end else None,
+                            fonte=a.fonte, max_minutes=max(0, a.max_minutes), enviar=a.enviar)
     if a.cmd == "inspect":
         return cmd_inspect(cfg, parse_date(a.date), a.grep, max(1, a.days))
     if a.cmd == "test-email":

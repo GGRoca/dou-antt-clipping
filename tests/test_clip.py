@@ -86,7 +86,7 @@ def make_zip(*xmls):
 def make_filtros():
     return [
         clip.Filtro("SUFER-Todas", "DO1", "Superintendência de Transporte Ferroviário", []),
-        clip.Filtro("ANTT-Deliberacoes", "DO1", "Diretoria Colegiada", ["Deliberação"]),
+        clip.Filtro("ANTT-Deliberacoes", "DO1", "Agência Nacional de Transportes Terrestres", ["Deliberação"]),
         clip.Filtro("ANTT-Portarias", "DO1", "Agência Nacional de Transportes Terrestres", ["Portaria"]),
         clip.Filtro("ANTT-Instrucoes", "DO1", "Agência Nacional de Transportes Terrestres", ["Instrução Normativa"]),
         clip.Filtro("ANTT-Retificacoes", "DO1", "Agência Nacional de Transportes Terrestres", ["Retificação"]),
@@ -331,6 +331,97 @@ class FakeInlabs:
         self.httpd.shutdown()
 
 
+def portal_item(url_title, art_type, hierarchy, title, page="10", edition="204",
+                pub="DO1", pub_date="28/10/2026"):
+    """Item do jsonArray do leiturajornal (14 chaves, como no portal real)."""
+    return {"pubName": pub, "urlTitle": url_title, "numberPage": page, "subTitulo": "",
+            "titulo": "", "title": title, "pubDate": pub_date,
+            "content": f"{title} texto truncado pelo portal...", "editionNumber": edition,
+            "hierarchyLevelSize": hierarchy.count("/") + 1, "artType": art_type,
+            "pubOrder": "DO100001:00001", "hierarchyStr": hierarchy,
+            "hierarchyList": hierarchy.split("/")}
+
+
+class FakePortal:
+    """www.in.gov.br: /leiturajornal?data=DD-MM-AAAA&secao=do1 e /web/dou/-/<urlTitle>.
+    Fora do ar por padrao, para nenhum teste do INLABS acionar a rede real."""
+    def __init__(self):
+        self.down = True
+        self.index = {}          # (date_iso, secao_lower) -> [items]
+        self.acts = {}           # urlTitle -> HTML interno de .texto-dou
+        self.broken_index = False
+        self.requests = []
+
+    def add(self, d, secao, item, texto_html):
+        self.index.setdefault((d.isoformat(), secao.lower()), []).append(item)
+        self.acts[item["urlTitle"]] = texto_html
+
+    def start(self):
+        import json as _json
+        srv = self
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+            def _send(self, code, body):
+                body = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "text/html;charset=UTF-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                u = urlparse(self.path); q = parse_qs(u.query)
+                srv.requests.append(self.path)
+                if srv.down:
+                    self._send(503, "<html>Service Unavailable</html>"); return
+                if u.path == "/leiturajornal":
+                    dd = q.get("data", [""])[0]
+                    d_iso = "-".join(reversed(dd.split("-")))
+                    secao = q.get("secao", [""])[0]
+                    base = secao[:3].upper()
+                    tnd = {f"{base}{s}": bool(srv.index.get((d_iso, f"{base}{s}".lower())))
+                           for s in ("E", "A", "ESP")}
+                    params = {"typeNormDay": tnd, "idPortletInstance": "x", "dateUrl": dd,
+                              "section": secao.upper(), "jsonArray": srv.index.get((d_iso, secao), [])}
+                    script = ("" if srv.broken_index else
+                              f'<script id="params" type="application/json">\n  {_json.dumps(params)}\n</script>')
+                    self._send(200, "<html><body><div id='leitura'></div>"
+                               '<script id="_br_com_seatecnologia_in_buscadou_BuscaDouPortlet_params" '
+                               'type="application/json">{"jsonArray":[]}</script>'
+                               f"{script}</body></html>")
+                    return
+                if u.path.startswith("/web/dou/-/"):
+                    texto = srv.acts.get(u.path[len("/web/dou/-/"):])
+                    if texto is None:
+                        self._send(404, "<html>Pagina nao encontrada</html>"); return
+                    self._send(200, "<html><body><article><div class='detalhes-dou'>Publicado em: "
+                               "28/10/2026 | Edição: 204</div>"
+                               f'<div class="texto-dou"> {texto} </div>'
+                               "<p class='informacao-conteudo-dou'>Este conteúdo não substitui o "
+                               "publicado na versão certificada.</p></article></body></html>")
+                    return
+                self._send(404, "<html>?</html>")
+        self.httpd = HTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        return self
+
+    def stop(self):
+        self.httpd.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def portal(monkeypatch):
+    srv = FakePortal().start()
+    base = f"http://127.0.0.1:{srv.port}"
+    monkeypatch.setattr(clip.PortalClient, "INDEX_URL", f"{base}/leiturajornal")
+    monkeypatch.setattr(clip.PortalClient, "ACT_URL", f"{base}/web/dou/-/")
+    monkeypatch.setattr(clip.PortalClient, "RETRY_WAITS", (0, 0))
+    yield srv
+    srv.stop()
+
+
 @pytest.fixture
 def inlabs(monkeypatch):
     srv = FakeInlabs().start()
@@ -448,6 +539,7 @@ def test_run_end_to_end_sends_matches_and_persists(tmp_path, inlabs, mailer, mon
     run = db.con.execute("SELECT * FROM runs ORDER BY id DESC").fetchone()
     assert (run["status"], run["files_processed"], run["new_matches"], run["emails_sent"]) == ("ok", 3, 2, 1)
     assert db.get("last_success_ts") and db.get("last_email_date") == "2026-09-16"
+    assert "Fonte:" not in html and "via INLABS." in html
 
     # segunda execucao no mesmo dia: nada novo, nenhum e-mail; so a extra (DO1E) e
     # re-baixada para checar o tamanho, as edicoes base nao
@@ -609,7 +701,7 @@ def test_unavailable_exits_zero_and_alerts_after_threshold(tmp_path, inlabs, mai
     db.set("last_success_ts", (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat())
     db.close()
     assert clip.cmd_run(cfg, date(2026, 9, 16), True, False) == 0
-    assert "ALERTA - INLABS inacessivel ha 30h" in mailer["m"].sent[0][0]
+    assert "ALERTA - INLABS e portal inacessiveis ha 30h" in mailer["m"].sent[0][0]
     # 3) de novo no mesmo dia: nao repete
     assert clip.cmd_run(cfg, date(2026, 9, 16), True, False) == 0
     assert mailer["m"].sent == []
@@ -659,7 +751,7 @@ def test_backfill_marks_matches_as_not_to_email(tmp_path, inlabs, mailer, monkey
     inlabs.files[("2026-09-15", "2026-09-15-DO1.zip")] = make_zip(DELIBERACAO)
     monkeypatch.setattr(clip.time, "sleep", lambda s: None)
     cfg = make_config(tmp_path)
-    assert clip.cmd_backfill(cfg, date(2026, 9, 14), date(2026, 9, 15)) == 0
+    assert clip.cmd_backfill(cfg, date(2026, 9, 14), date(2026, 9, 15), fonte="inlabs") == 0
     db = clip.Storage(cfg.db_path)
     assert db.con.execute("SELECT count(*) FROM matches WHERE emailed_ts='backfill'").fetchone()[0] == 2
     assert db.pending_matches() == []
@@ -733,3 +825,293 @@ def test_empty_extra_zip_does_not_hide_weekend_pdf(tmp_path, inlabs, mailer, mon
     inlabs.files[("2026-08-30", "2026-08-30-DO1E.zip")] = make_zip(DESPACHO_SUFER)
     clip.cmd_run(cfg, date(2026, 8, 31), True, False)
     assert len(mailer["m"].sent) == 1 and "Defiro o pedido" in mailer["m"].sent[0][1]
+
+
+# ---------------------------------------------------------------------------
+# fallback: portal in.gov.br (leiturajornal + pagina do ato)
+# ---------------------------------------------------------------------------
+
+D_PORTAL = date(2026, 10, 28)                      # quarta-feira
+SUROD = ANTT + "/Superintendência de Infraestrutura Rodoviária"
+
+SUFER_URL = "decisao-sufer-n-130-de-26-de-outubro-de-2026-740000001"
+SUFER_ITEM = portal_item(SUFER_URL, "Decisão", SUFER,
+                         "DECISÃO SUFER Nº 130, DE 26 DE OUTUBRO DE 2026", page="150")
+SUFER_TEXTO = ('<p class="identifica">DECISÃO SUFER Nº 130, DE 26 DE OUTUBRO DE 2026</p>'
+               '<p class="dou-paragraph">O SUPERINTENDENTE DE TRANSPORTE FERROVIÁRIO decide:</p>'
+               '<p class="dou-paragraph">Art. 1º Aprovar o projeto.</p>'
+               '<p class="assina">MARIA SOUZA</p><p class="cargo">Superintendente</p>')
+# Extra real de 20/10/2026: o portal omitiu "Diretoria Colegiada" da hierarquia
+DELIB_URL = "deliberacao-antt-n-310-de-27-de-outubro-de-2026-740000002"
+DELIB_ITEM = portal_item(DELIB_URL, "Deliberação", ANTT,
+                         "DELIBERAÇÃO ANTT Nº 310, DE 27 DE OUTUBRO DE 2026",
+                         page="3", edition="204-A", pub="DO1_EXTRA_A")
+DELIB_TEXTO = ('<p class="identifica">DELIBERAÇÃO ANTT Nº 310, DE 27 DE OUTUBRO DE 2026</p>'
+               '<p class="ementa">Autoriza nova seção.</p><p class="dou-paragraph">A Diretoria delibera.</p>')
+OUTRO_ITEM = portal_item("portaria-n-9-740000003", "Portaria", OUTRO, "PORTARIA Nº 9", page="80")
+SUROD_ITEM = portal_item("decisao-surod-n-1-740000004", "Decisão", SUROD, "DECISÃO SUROD Nº 1", page="151")
+
+
+def fill_portal(portal):
+    portal.down = False
+    portal.add(D_PORTAL, "do1", SUFER_ITEM, SUFER_TEXTO)
+    portal.add(D_PORTAL, "do1", OUTRO_ITEM, "<p>nada</p>")
+    portal.add(D_PORTAL, "do1", SUROD_ITEM, "<p>rodovia</p>")
+    portal.add(D_PORTAL, "do1e", DELIB_ITEM, DELIB_TEXTO)
+
+
+def act_pages(portal, since=0):
+    return [p for p in portal.requests[since:] if p.startswith("/web/dou/-/")]
+
+
+def test_portal_client_parses_index_and_act(portal):
+    fill_portal(portal)
+    c = clip.PortalClient()
+    items, edicoes = c.index(D_PORTAL, "DO1")
+    assert [i["urlTitle"] for i in items] == [SUFER_URL, OUTRO_ITEM["urlTitle"], SUROD_ITEM["urlTitle"]]
+    assert edicoes["DO1E"] is True and edicoes["DO1A"] is False
+    assert "data=28-10-2026&secao=do1" in portal.requests[-1]
+    assert c.index(date(2026, 10, 31), "DO1") == ([], {"DO1E": False, "DO1A": False, "DO1ESP": False})
+    p = clip.portal_publication(DELIB_ITEM, D_PORTAL, "DO1")
+    assert (p.article_id, p.source_file, p.pub_name, p.edition_number, p.number_page) == (
+        f"portal:{DELIB_URL}", "portal:2026-10-28-DO1E", "DO1E", "204-A", "3")
+    assert p.art_category == ANTT and p.pdf_page.endswith(f"/web/dou/-/{DELIB_URL}")
+    clip.portal_fill_text(p, c.act_html(DELIB_URL))
+    assert p.texto.startswith("DELIBERAÇÃO ANTT Nº 310") and "A Diretoria delibera." in p.texto
+    assert p.ementa == "Autoriza nova seção." and '<p class="ementa">' in p.texto_html
+    s = clip.portal_publication(SUFER_ITEM, D_PORTAL, "DO1")
+    clip.portal_fill_text(s, c.act_html(SUFER_URL))
+    assert (s.assina, s.cargo, s.pub_name) == ("MARIA SOUZA", "Superintendente", "DO1")
+
+
+def test_portal_errors_unavailable_vs_format(portal):
+    c = clip.PortalClient()
+    with pytest.raises(clip.PortalUnavailable):          # 503 em todas as tentativas
+        c.index(D_PORTAL, "DO1")
+    portal.down = False
+    with pytest.raises(clip.PortalFormatError):          # listado no indice, pagina 404
+        c.act_html("nao-existe-1")
+    portal.broken_index = True
+    with pytest.raises(clip.PortalFormatError):          # pagina sem <script id="params">
+        c.index(D_PORTAL, "DO1")
+
+
+def test_run_falls_back_to_portal_when_inlabs_is_down(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    inlabs.login_404 = True
+    fill_portal(portal)
+    cfg = make_config(tmp_path)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    m = mailer["m"]
+    assert len(m.sent) == 1
+    subject, html = m.sent[0]
+    assert subject == "[DOU][ANTT][SUFER] 28/10/2026 - 2 publicacao(oes)"
+    assert "Fonte: portal in.gov.br" in html and "vieram do indice publico do DOU" in html
+    assert "Art. 1º Aprovar o projeto." in html and "MARIA SOUZA" in html
+    assert "Secao 1 - Extra | Edicao 204-A | Pagina 3" in html     # DO1_EXTRA_A -> DO1E
+    assert "PORTARIA Nº 9" not in html and "SUROD" not in html
+    # so as paginas dos atos que casaram com os filtros sao baixadas
+    assert sorted(act_pages(portal)) == sorted([f"/web/dou/-/{SUFER_URL}", f"/web/dou/-/{DELIB_URL}"])
+    db = clip.Storage(cfg.db_path)
+    run = db.con.execute("SELECT * FROM runs ORDER BY id DESC").fetchone()
+    assert run["status"] == "portal" and "fallback portal" in run["notes"] and "HTTP 404" in run["notes"]
+    row = db.con.execute("SELECT * FROM matches WHERE article_id=?", (f"portal:{SUFER_URL}",)).fetchone()
+    assert row["file_name"] == "portal:2026-10-28-DO1" and row["assina"] == "MARIA SOUZA"
+    assert db.file_articles("portal:2026-10-28-DO1") == 3 and db.get("last_success_ts")
+    db.close()
+    # proxima execucao: nenhuma pagina de ato de novo, nenhum e-mail
+    n = len(portal.requests)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    assert act_pages(portal, n) == [] and mailer["m"].sent == []
+
+
+def inlabs_versions():
+    """Os mesmos atos de fill_portal como o INLABS os entrega (ids e artCategory proprios)."""
+    sufer = article_xml("9001", "Decisão", SUFER, "DECISÃO SUFER Nº 130, DE 26 DE OUTUBRO DE 2026",
+                        SUFER_TEXTO, page="150", edition="204", pub_date="28/10/2026")
+    delib = article_xml("9002", "Deliberação", DIRETORIA, "Deliberação ANTT Nº 310, DE 27 DE OUTUBRO DE 2026",
+                        DELIB_TEXTO, page="3", edition="204-A", pub_name="DO1E", pub_date="28/10/2026")
+    return sufer, delib
+
+
+def test_inlabs_back_after_portal_does_not_duplicate(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    inlabs.login_404 = True
+    fill_portal(portal)
+    cfg = make_config(tmp_path)
+    clip.cmd_run(cfg, D_PORTAL, True, False)
+    assert len(mailer["m"].sent) == 1
+    # INLABS volta e a janela reprocessa a data: mesmos atos com outro id -> sem reenvio
+    inlabs.login_404 = False
+    sufer, delib = inlabs_versions()
+    inlabs.files[("2026-10-28", "2026-10-28-DO1.zip")] = make_zip(sufer, DESPACHO_SUFER)
+    inlabs.files[("2026-10-28", "2026-10-28-DO1E.zip")] = make_zip(delib)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    assert len(mailer["m"].sent) == 1                       # so o ato realmente novo
+    assert "Defiro o pedido" in mailer["m"].sent[0][1] and "Aprovar o projeto" not in mailer["m"].sent[0][1]
+    db = clip.Storage(cfg.db_path)
+    assert db.con.execute("SELECT count(*) FROM matches").fetchone()[0] == 3
+    assert db.con.execute("SELECT status FROM runs ORDER BY id DESC").fetchone()[0] == "ok"
+
+
+def test_portal_skips_acts_inlabs_already_captured(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    sufer, delib = inlabs_versions()
+    inlabs.files[("2026-10-28", "2026-10-28-DO1.zip")] = make_zip(sufer)
+    inlabs.files[("2026-10-28", "2026-10-28-DO1E.zip")] = make_zip(delib)
+    cfg = make_config(tmp_path)
+    clip.cmd_run(cfg, D_PORTAL, True, False)
+    assert "2 publicacao(oes)" in mailer["m"].sent[0][0]
+    # INLABS cai; o portal ve os mesmos atos e nem abre as paginas deles
+    inlabs.login_404 = True
+    fill_portal(portal)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    assert act_pages(portal) == [] and mailer["m"].sent == []
+    assert clip.Storage(cfg.db_path).con.execute("SELECT count(*) FROM matches").fetchone()[0] == 2
+
+
+def test_same_source_acts_with_same_identifica_are_kept(tmp_path):
+    """15/09/2026 real: tres 'RETIFICAÇÃO' da ANTT na mesma pagina, todas do INLABS."""
+    db = clip.Storage(str(tmp_path / "s.sqlite"))
+    xmls = [article_xml(str(4000 + i), "Retificação", SUFER, "RETIFICAÇÃO", f"<p>ret {i}</p>", page="102")
+            for i in range(3)]
+    pubs = clip.parse_zip(make_zip(*xmls), "2026-09-15-DO1.zip", date(2026, 9, 15))
+    assert [db.add_match(clip.Match(p, ["x"])) for p in pubs] == [True, True, True]
+    ret = clip.portal_publication(portal_item("retificacao-1", "Retificação", SUFER, "RETIFICAÇÃO",
+                                              page="102", edition="177"), date(2026, 9, 15), "DO1")
+    assert db.same_act_other_source(ret) is True
+
+
+def test_portal_down_too_keeps_unavailable_status(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    inlabs.login_404 = True                                  # portal.down = True (padrao)
+    cfg = make_config(tmp_path)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    run = clip.Storage(cfg.db_path).con.execute("SELECT * FROM runs").fetchone()
+    assert run["status"] == "inlabs_unavailable"
+    assert "INLABS: Login respondeu HTTP 404" in run["notes"] and "portal: portal in.gov.br inacessivel" in run["notes"]
+
+
+def test_portal_format_change_fails_explicitly(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    inlabs.login_404 = True
+    fill_portal(portal)
+    portal.broken_index = True
+    cfg = make_config(tmp_path)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 1
+    run = clip.Storage(cfg.db_path).con.execute("SELECT * FROM runs").fetchone()
+    assert run["status"] == "error" and "PortalFormatError" in run["notes"]
+
+
+def test_portal_act_page_error_is_recorded_and_retried(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    inlabs.login_404 = True
+    fill_portal(portal)
+    texto = portal.acts.pop(DELIB_URL)                       # pagina do ato responde 404
+    cfg = make_config(tmp_path)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 1
+    assert len(mailer["m"].sent) == 1 and "1 publicacao(oes)" in mailer["m"].sent[0][0]
+    run = clip.Storage(cfg.db_path).con.execute("SELECT * FROM runs").fetchone()
+    assert run["status"] == "error" and DELIB_URL in run["notes"]
+    portal.acts[DELIB_URL] = texto
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    assert "DELIBERAÇÃO ANTT Nº 310" in mailer["m"].sent[0][1]
+
+
+def test_daily_confirmation_via_portal(tmp_path, inlabs, mailer, monkeypatch, portal):
+    freeze_today(monkeypatch, D_PORTAL)
+    inlabs.login_404 = True
+    portal.down = False
+    portal.add(D_PORTAL, "do1", OUTRO_ITEM, "<p>nada</p>")
+    cfg = make_config(tmp_path)
+    assert clip.cmd_run(cfg, D_PORTAL, True, False) == 0
+    subject, html = mailer["m"].sent[0]
+    assert subject.endswith("28/10/2026 - sem novidades")
+    assert "Edicao de hoje verificada: DO1" in html and "Fonte desta consulta: portal in.gov.br" in html
+
+
+# ---------------------------------------------------------------------------
+# backfill em lotes retomaveis
+# ---------------------------------------------------------------------------
+
+def read_kv(path):
+    return dict(l.split("=", 1) for l in path.read_text(encoding="utf-8").splitlines() if "=" in l)
+
+
+def test_backfill_portal_in_batches_resumes_and_reports(tmp_path, mailer, monkeypatch, portal):
+    d1, d3 = date(2026, 10, 26), D_PORTAL
+    portal.down = False
+    portal.add(d1, "do1", portal_item("decisao-sufer-n-1-1", "Decisão", SUFER, "DECISÃO SUFER Nº 1",
+                                      pub_date="26/10/2026"), "<p>um</p>")
+    portal.add(d3, "do1", SUFER_ITEM, SUFER_TEXTO)
+    monkeypatch.setattr(clip.time, "sleep", lambda s: None)
+    clock = iter(range(0, 100_000, 61))                     # cada leitura do relogio: +61 s
+    monkeypatch.setattr(clip.time, "monotonic", lambda: next(clock))
+    out, summary = tmp_path / "out", tmp_path / "summary"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    cfg = make_config(tmp_path)
+
+    assert clip.cmd_backfill(cfg, d1, d3, max_minutes=1) == 0        # lote de 1 min: so d1
+    assert read_kv(out) == {"next_start": "2026-10-27", "end": "2026-10-28", "status": "parcial"}
+    db = clip.Storage(cfg.db_path)
+    assert (db.get("backfill_next"), db.get("backfill_end")) == ("2026-10-27", "2026-10-28")
+    assert db.con.execute("SELECT count(*) FROM matches WHERE emailed_ts='backfill'").fetchone()[0] == 1
+    db.close()
+
+    out.unlink()
+    assert clip.cmd_backfill(cfg, None, None) == 0                     # retoma ate o fim gravado
+    assert read_kv(out) == {"next_start": "", "end": "2026-10-28", "status": "concluido"}
+    db = clip.Storage(cfg.db_path)
+    assert db.get("backfill_next") is None and db.get("backfill_end") is None
+    assert db.con.execute("SELECT count(*) FROM matches WHERE emailed_ts='backfill'").fetchone()[0] == 2
+    assert db.pending_matches() == [] and "m" not in mailer
+    notes = [r[0] for r in db.con.execute("SELECT notes FROM runs ORDER BY id")]
+    assert notes[0].startswith("backfill[portal] 2026-10-26..2026-10-28: processado 2026-10-26..2026-10-26; proximo: 2026-10-27")
+    assert notes[1].startswith("backfill[portal] 2026-10-27..2026-10-28: processado 2026-10-27..2026-10-28; concluido")
+    assert "Backfill concluido" in summary.read_text(encoding="utf-8")
+
+
+def test_backfill_enviar_leaves_matches_for_daily_email(tmp_path, monkeypatch, portal):
+    portal.down = False
+    portal.add(D_PORTAL, "do1", SUFER_ITEM, SUFER_TEXTO)
+    monkeypatch.setattr(clip.time, "sleep", lambda s: None)
+    cfg = make_config(tmp_path)
+    assert clip.cmd_backfill(cfg, D_PORTAL, D_PORTAL, enviar=True) == 0
+    assert len(clip.Storage(cfg.db_path).pending_matches()) == 1
+
+
+def test_backfill_stops_where_source_failed(tmp_path, monkeypatch, portal):
+    monkeypatch.setattr(clip.time, "sleep", lambda s: None)
+    cfg = make_config(tmp_path)
+    with pytest.raises(SystemExit):                                    # nada para retomar
+        clip.cmd_backfill(cfg, None, None)
+    # portal fora do ar: para na primeira data, exit 0, retomada comeca nela
+    assert clip.cmd_backfill(cfg, date(2026, 10, 26), D_PORTAL) == 0
+    db = clip.Storage(cfg.db_path)
+    assert db.get("backfill_next") == "2026-10-26"
+    assert db.con.execute("SELECT status FROM runs").fetchone()[0] == "portal_unavailable"
+    db.close()
+    # pagina de ato com erro: exit 1, a data volta na retomada
+    fill_portal(portal)
+    portal.acts.pop(SUFER_URL)
+    assert clip.cmd_backfill(cfg, None, None) == 1
+    db = clip.Storage(cfg.db_path)
+    assert db.get("backfill_next") == "2026-10-28"
+    assert db.con.execute("SELECT status FROM runs ORDER BY id DESC").fetchone()[0] == "error"
+
+
+def test_backfill_cli_arguments(tmp_path, monkeypatch, portal):
+    calls = []
+    monkeypatch.setattr(clip, "cmd_backfill", lambda cfg, s, e, **kw: calls.append((s, e, kw)) or 0)
+    y = tmp_path / "c.yml"
+    y.write_text("""
+filtros: [{nome: A, secao: DO1, orgao: X, art_types: []}]
+mail: {smtp_host: h, smtp_port: 1, from_email: a@b, to_emails: [c@d]}
+storage: {db_path: x.sqlite}
+""", encoding="utf-8")
+    clip.main(["--config", str(y), "backfill"])
+    clip.main(["--config", str(y), "backfill", "--start", "2022-01-01", "--end", "2022-01-31",
+               "--fonte", "inlabs", "--max-minutes", "45", "--enviar"])
+    assert calls[0] == (None, None, {"fonte": "portal", "max_minutes": 0, "enviar": False})
+    assert calls[1] == (date(2022, 1, 1), date(2022, 1, 31), {"fonte": "inlabs", "max_minutes": 45, "enviar": True})

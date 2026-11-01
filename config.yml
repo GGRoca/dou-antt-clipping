@@ -8,7 +8,8 @@ inlabs:
   password: ""
 
 # Janela de revarredura a cada execução: D-lookback_days ... D0.
-# Edições extras podem aparecer com atraso e o INLABS pode ficar dias fora do ar;
+# Edições extras podem aparecer com atraso e o INLABS pode ficar dias fora do ar
+# (nesse caso a janela é consultada no índice público do portal in.gov.br);
 # arquivos já processados não são baixados de novo (extras são re-checadas por
 # tamanho), então uma janela maior custa só algumas listagens a mais.
 lookback_days: 5
@@ -55,9 +56,14 @@ filtros:
     orgao: "Superintendência de Transporte Ferroviário"
     art_types: []
 
+  # Deliberação é ato exclusivo da Diretoria Colegiada, mas o órgão às vezes vem
+  # sem a unidade ("Ministério dos Transportes/Agência Nacional de Transportes
+  # Terrestres"). Ex.: a Deliberação ANTT nº 298 (extra de 20/10/2026) no portal; e
+  # a nº 281 (18/09/2026), sem unidade no portal, não entrou no banco com o filtro
+  # antigo por "Diretoria Colegiada".
   - nome: "ANTT-Deliberacoes"
     secao: "DO1"
-    orgao: "Diretoria Colegiada"
+    orgao: "Agência Nacional de Transportes Terrestres"
     art_types: ["Deliberação"]
 
   - nome: "ANTT-Portarias"
