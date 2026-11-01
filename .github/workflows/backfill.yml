@@ -1,26 +1,50 @@
 name: Backfill Histórico
 
+# Popula o banco em lotes de até N minutos. Ao fim de um lote parcial, o próximo
+# é disparado automaticamente com a data inicial em branco (= retomar de onde
+# parou, gravado em state.backfill_next no banco). Fonte fora do ar ou erro numa
+# data param a corrente nessa data: rode de novo com a data inicial em branco.
+
 on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: "Data inicial (YYYY-MM-DD)"
-        required: true
+        description: "Data inicial YYYY-MM-DD (vazio = retomar o backfill em andamento)"
+        required: false
+        default: ""
       end_date:
-        description: "Data final (YYYY-MM-DD)"
-        required: true
+        description: "Data final YYYY-MM-DD (vazio = a do backfill em andamento, ou hoje)"
+        required: false
+        default: ""
+      fonte:
+        description: "portal = índice público do DOU (funciona com o INLABS fora do ar e em datas antigas) | inlabs"
+        type: choice
+        default: portal
+        options: [portal, inlabs]
+      enviar_email:
+        description: "Achados vão no próximo e-mail do Clipping Diário (use só para repor uma lacuna recente)"
+        type: boolean
+        default: false
+      minutos:
+        description: "Duração máxima de cada lote, em minutos (máx. 100)"
+        required: false
+        default: "45"
 
 permissions:
   contents: write
-
-concurrency:
-  group: clipping-db
-  cancel-in-progress: false
+  actions: write   # disparar o próximo lote
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Mesmo grupo do Clipping Diário: os dois gravam o banco no branch 'data'.
+    concurrency:
+      group: clipping-db
+      cancel-in-progress: false
+    outputs:
+      status: ${{ steps.lote.outputs.status }}
+      end: ${{ steps.lote.outputs.end }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,14 +59,39 @@ jobs:
       - name: Restaurar banco do branch 'data'
         run: bash scripts/restore_db.sh
 
-      - name: Backfill (sem e-mail; achados marcados como 'backfill')
+      - name: Backfill (um lote)
+        id: lote
         env:
           INLABS_EMAIL: ${{ secrets.INLABS_EMAIL }}
           INLABS_PASSWORD: ${{ secrets.INLABS_PASSWORD }}
           START: ${{ inputs.start_date }}
           END: ${{ inputs.end_date }}
-        run: python clip.py backfill --start "$START" --end "$END"
+          FONTE: ${{ inputs.fonte }}
+          MINUTOS: ${{ inputs.minutos }}
+          ENVIAR: ${{ inputs.enviar_email == true && '1' || '' }}
+        run: |
+          if [ "${MINUTOS:-45}" -gt 100 ]; then MINUTOS=100; fi
+          python clip.py backfill ${START:+--start "$START"} ${END:+--end "$END"} \
+            --fonte "$FONTE" --max-minutes "${MINUTOS:-45}" ${ENVIAR:+--enviar}
 
       - name: Persistir banco no branch 'data'
         if: always()
         run: bash scripts/persist_db.sh
+
+  proximo-lote:
+    # Fora do grupo de concorrência: só dispara depois que o lote liberou o banco.
+    needs: backfill
+    if: needs.backfill.outputs.status == 'parcial'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disparar o próximo lote
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run backfill.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            -f start_date= \
+            -f end_date="${{ needs.backfill.outputs.end }}" \
+            -f fonte="${{ inputs.fonte }}" \
+            -f enviar_email="${{ inputs.enviar_email }}" \
+            -f minutos="${{ inputs.minutos }}"
+          echo "Próximo lote disparado (fim: ${{ needs.backfill.outputs.end }})." >> "$GITHUB_STEP_SUMMARY"
