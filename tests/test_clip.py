@@ -1135,3 +1135,78 @@ def test_backfill_enviar_requeues_existing_backfill_matches_and_keeps_resume_poi
     assert [r["article_id"] for r in db.pending_matches()] == [f"portal:{SUFER_URL}"]
     assert act_pages(portal, n) == []                                     # nada baixado de novo
     assert (db.get("backfill_next"), db.get("backfill_end")) == ("2024-01-01", "2026-11-01")
+
+
+# ---------------------------------------------------------------------------
+# busca web (export-busca -> data/busca.sqlite.gz -> docs/index.html)
+# ---------------------------------------------------------------------------
+
+def open_busca(gz_path, tmp_path):
+    import gzip
+    import sqlite3
+    f = tmp_path / "busca_aberto.sqlite"
+    f.write_bytes(gzip.decompress(gz_path.read_bytes()))
+    con = sqlite3.connect(str(f))
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def test_unidade_antt_unifies_ministries_and_missing_unit():
+    assert clip.unidade_antt(SUFER) == "Superintendência de Transporte Ferroviário"
+    assert clip.unidade_antt("Ministério da Infraestrutura/Agência Nacional de "
+                             "Transportes Terrestres/Diretoria Colegiada") == "Diretoria Colegiada"
+    assert clip.unidade_antt(ANTT) == clip.SEM_UNIDADE
+    assert clip.unidade_antt(OUTRO) == OUTRO
+
+
+def test_export_busca_only_acts_with_accent_insensitive_fts(tmp_path):
+    db = clip.Storage(str(tmp_path / "c.sqlite"))
+    for xml, filtro in ((PORTARIA_SUFER, "SUFER-Todas"), (DELIBERACAO, "ANTT-Deliberacoes")):
+        db.add_match(clip.Match(clip.parse_articles(xml, "f.zip", EDITION)[0], [filtro]))
+    alerta = clip.Publication("pdf:x", "x.pdf", EDITION, art_type="Edicao em PDF",
+                              identifica="Extra so em PDF", texto="ANTT", kind="pdf_alert")
+    db.add_match(clip.Match(alerta, ["SUFER-Todas"]))
+    db.close()
+    out = tmp_path / "pagina" / "busca.sqlite.gz"
+    assert clip.export_busca(str(tmp_path / "c.sqlite"), str(out)) == 2      # sem o alerta
+    assert sorted(os.listdir(out.parent)) == ["busca.sqlite.gz"]             # sem temporarios
+    con = open_busca(out, tmp_path)
+    rows = con.execute("SELECT * FROM atos ORDER BY id").fetchall()
+    assert [r["art_type"] for r in rows] == ["Portaria", "Deliberação"]
+    assert (rows[0]["unidade"], rows[0]["fonte"]) == ("Superintendência de Transporte Ferroviário", "INLABS")
+    assert "<table>" in rows[0]["texto_html"] and rows[0]["link"].startswith("https://pesquisa.in.gov.br")
+
+    def busca(q):
+        return [r[0] for r in con.execute(
+            "SELECT a.article_id FROM atos_fts JOIN atos a ON a.id = atos_fts.rowid "
+            "WHERE atos_fts MATCH ? ORDER BY a.id", (q,))]
+    assert busca("operacao ferroviaria") == ["1001"]       # sem acento acha o texto acentuado
+    assert busca('"FERROVIÁRIA no trecho"') == ["1001"]    # frase, maiusculas
+    assert busca("assina:silva") == ["1001"]
+    assert busca("delibera") == ["1002"]
+    info = dict(con.execute("SELECT key, value FROM info").fetchall())
+    assert (info["atos"], info["data_inicial"], info["data_final"]) == ("2", "2026-09-16", "2026-09-16")
+    assert info["ultimo_ato_gravado"].startswith(date.today().isoformat()[:4])
+
+
+def test_export_busca_cli_is_deterministic(tmp_path):
+    db_path = tmp_path / "dados" / "clipping.sqlite"
+    db = clip.Storage(str(db_path))
+    db.add_match(clip.Match(clip.parse_articles(PORTARIA_SUFER, "f.zip", EDITION)[0], ["SUFER-Todas"]))
+    db.close()
+    y = tmp_path / "c.yml"
+    y.write_text(f"""
+filtros: [{{nome: A, secao: DO1, orgao: X, art_types: []}}]
+mail: {{smtp_host: h, smtp_port: 1, from_email: a@b, to_emails: [c@d]}}
+storage: {{db_path: '{db_path.as_posix()}'}}
+""", encoding="utf-8")
+    gz = db_path.parent / "busca.sqlite.gz"
+    assert clip.main(["--config", str(y), "export-busca"]) == 0
+    first = gz.read_bytes()
+    assert clip.main(["--config", str(y), "export-busca"]) == 0
+    assert gz.read_bytes() == first                          # mesmos atos, mesmos bytes
+    db = clip.Storage(str(db_path))
+    db.add_match(clip.Match(clip.parse_articles(DELIBERACAO, "f.zip", EDITION)[0], ["ANTT-Deliberacoes"]))
+    db.close()
+    assert clip.main(["--config", str(y), "export-busca"]) == 0
+    assert gz.read_bytes() != first

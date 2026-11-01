@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Busca DOU ANTT</title>
+<meta name="description" content="Busca nos atos da ANTT e da SUFER capturados pelo Clipping DOU">
+<!--
+  Pagina estatica (GitHub Pages, pasta docs/ do branch main). Baixa
+  data/busca.sqlite.gz do branch 'data' -- gerado pelo `clip.py export-busca`
+  no scripts/persist_db.sh a cada execucao -- e consulta tudo no navegador com
+  o SQLite oficial em WebAssembly (indice FTS5). Para testar com outro arquivo:
+  index.html?base=<url do .sqlite.gz>
+-->
+<style>
+:root {
+  --bg: #f4f6f4; --surface: #ffffff; --text: #1c2420; --muted: #5a6660; --line: #dbe1dd;
+  --accent: #1d6a51; --accent-weak: #e2efe9; --mark: #ffe98a; --danger: #a3382a;
+  --radius: 8px;
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131715; --surface: #1b201d; --text: #e4eae6; --muted: #9ba7a1; --line: #2e3631;
+    --accent: #6cc4a1; --accent-weak: #1f3a2f; --mark: #6b5a10; --danger: #ff8d78;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.45; }
+header { padding: 20px 16px 8px; max-width: 1240px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+#status { margin: 0; color: var(--muted); font-size: 13px; }
+#status.erro, .erro { color: var(--danger); }
+.layout { display: grid; gap: 16px; padding: 8px 16px 40px; max-width: 1240px; margin: 0 auto; }
+@media (min-width: 900px) {
+  .layout { grid-template-columns: 320px minmax(0, 1fr); align-items: start; }
+  .painel { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; }
+}
+.painel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+.painel label, .painel legend { display: block; font-size: 12px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; margin: 14px 0 6px; padding: 0; }
+.painel > label:first-child { margin-top: 0; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+input[type="search"], input[type="date"], select {
+  width: 100%; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 10px; }
+input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dica { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+.dica code { background: var(--accent-weak); padding: 0 3px; border-radius: 3px; font-size: 11.5px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.painel .chip { position: relative; display: inline-block; margin: 0; text-transform: none; letter-spacing: 0;
+  font-weight: 400; color: var(--text); }
+.chip input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.chip span { display: inline-block; font-size: 13px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--bg); cursor: pointer; user-select: none; }
+.chip span small { color: var(--muted); }
+.chip input:checked + span { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.chip input:checked + span small { color: inherit; opacity: .85; }
+.chip input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+#mais-filtros > summary { cursor: pointer; margin-top: 14px; font-size: 14px; font-weight: 600; color: var(--accent); }
+@media (min-width: 900px) { #mais-filtros > summary { display: none; } }
+.datas { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.datas label { text-transform: none; letter-spacing: 0; font-weight: 400; margin: 0; }
+button { font: inherit; cursor: pointer; }
+#limpar { margin-top: 16px; width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: transparent; color: var(--text); }
+#contagem { margin: 4px 0 10px; color: var(--muted); font-size: 14px; }
+#lista { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.ato { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.cabeca { display: block; width: 100%; text-align: left; background: none; border: 0; color: inherit; padding: 12px 16px; }
+.cabeca:hover { background: var(--accent-weak); }
+.meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12.5px; color: var(--muted); margin-bottom: 3px; }
+.meta .tipo { color: var(--accent); font-weight: 600; }
+.titulo { display: block; font-weight: 600; }
+.ementa { display: block; font-size: 13.5px; color: var(--muted); margin-top: 3px;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.trecho { display: block; font-size: 13.5px; margin-top: 6px; overflow-wrap: anywhere; }
+mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
+.detalhe { border-top: 1px solid var(--line); padding: 10px 16px 16px; }
+.detalhe .info { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; overflow-wrap: anywhere; }
+.detalhe a { color: var(--accent); }
+.detalhe iframe { display: block; width: 100%; border: 1px solid var(--line); border-radius: 6px; background: #fff; height: 200px; }
+#mais { display: block; margin: 14px auto 0; padding: 8px 18px; border-radius: 6px; border: 1px solid var(--accent);
+  background: transparent; color: var(--accent); }
+.vazio { background: var(--surface); border: 1px dashed var(--line); border-radius: var(--radius); padding: 24px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Busca de atos · Clipping DOU ANTT/SUFER</h1>
+  <p id="status" role="status">Carregando a base…</p>
+</header>
+<main class="layout">
+  <form id="filtros" class="painel" role="search" autocomplete="off">
+    <label for="q">Palavra-chave</label>
+    <input id="q" type="search" placeholder='malha paulista, "outorga por autorização", ferrovi*' disabled>
+    <p class="dica">O ato precisa ter todas as palavras. <code>"entre aspas"</code> = frase exata;
+      <code>ferrovi*</code> = começa com; <code>-palavra</code> = exclui; <code>OU</code> entre duas
+      palavras = qualquer uma. Acentos e maiúsculas são ignorados.</p>
+    <details id="mais-filtros">
+    <summary>Filtros</summary>
+    <label for="em">Procurar em</label>
+    <select id="em" disabled>
+      <option value="">todo o ato</option>
+      <option value="identifica">identificação (título e número)</option>
+      <option value="ementa">ementa</option>
+      <option value="assina">assinatura</option>
+    </select>
+    <fieldset>
+      <legend>Tipo de ato</legend>
+      <div id="tipos" class="chips"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Período (data da edição)</legend>
+      <div class="datas">
+        <label>de <input id="de" type="date" disabled></label>
+        <label>até <input id="ate" type="date" disabled></label>
+      </div>
+    </fieldset>
+    <label for="unidade">Unidade da ANTT</label>
+    <select id="unidade" disabled><option value="">todas</option></select>
+    <label for="ordem">Ordenar por</label>
+    <select id="ordem" disabled>
+      <option value="recentes">mais recentes</option>
+      <option value="antigos">mais antigos</option>
+      <option value="relevancia">relevância (com palavra-chave)</option>
+    </select>
+    </details>
+    <button type="reset" id="limpar" disabled>Limpar filtros</button>
+  </form>
+  <section aria-label="Resultados">
+    <p id="contagem" aria-live="polite"></p>
+    <ol id="lista"></ol>
+    <button id="mais" type="button" hidden>Mostrar mais</button>
+  </section>
+</main>
+
+<script type="module">
+const SQLITE_WASM = 'https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.54.1-build1/dist/index.mjs';
+const BASE_PADRAO = 'https://raw.githubusercontent.com/GGRoca/dou-antt-clipping/data/data/busca.sqlite.gz';
+const BASE_URL = new URLSearchParams(location.search).get('base') || BASE_PADRAO;
+const POR_PAGINA = 50;
+
+// Estilo do texto do ato, aplicado dentro do iframe isolado (sem scripts).
+const CSS_ATO = `html{color-scheme:light}
+body{margin:0;padding:18px 22px;font:15px/1.6 Georgia,"Times New Roman",serif;color:#1c2420;background:#fff;overflow-wrap:anywhere}
+p{margin:0 0 .7em}.identifica{font-weight:700;text-align:center;margin-bottom:1em}
+.ementa{font-style:italic;margin:0 0 1em 35%}@media(max-width:600px){.ementa{margin-left:0}}
+.assina{font-weight:700;text-align:center;margin:1.2em 0 0}.cargo{text-align:center;font-style:italic}
+table{border-collapse:collapse;margin:.6em 0;font:13px/1.4 system-ui,sans-serif;display:block;overflow-x:auto;max-width:100%}
+td,th{border:1px solid #c9d1cc;padding:3px 6px;vertical-align:top}img{max-width:100%;height:auto}
+pre{white-space:pre-wrap;font:inherit}`;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const dataBR = (iso) => (iso ? iso.slice(0, 10).split('-').reverse().join('/') : '');
+const num = (n) => Number(n).toLocaleString('pt-BR');
+const mb = (b) => (b / 1e6).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' MB';
+const CONTROLES = ['q', 'em', 'de', 'ate', 'unidade', 'ordem', 'limpar'];
+
+let db = null;
+let resultados = [];
+let mostrados = 0;
+
+function status(msg, erro = false) {
+  $('status').textContent = msg;
+  $('status').classList.toggle('erro', erro);
+}
+
+// ---------------------------------------------------------------- carga --
+
+async function baixarBase(url) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('este navegador não descompacta gzip (DecompressionStream); use uma versão recente do Chrome, Edge, Firefox ou Safari');
+  }
+  const resp = await fetch(url, { cache: 'no-cache' });   // revalida pelo ETag
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ao baixar ${url}`);
+  const total = Number(resp.headers.get('content-length')) || 0;
+  const reader = resp.body.getReader();
+  const partes = [];
+  let recebidos = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    partes.push(value);
+    recebidos += value.byteLength;
+    status(`Baixando a base… ${mb(recebidos)}${total ? ' de ' + mb(total) : ''}`);
+  }
+  let bytes = new Uint8Array(await new Blob(partes).arrayBuffer());
+  if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+    const fluxo = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    bytes = new Uint8Array(await new Response(fluxo).arrayBuffer());
+  }
+  if (new TextDecoder().decode(bytes.subarray(0, 15)) !== 'SQLite format 3') {
+    throw new Error('o arquivo baixado não é um banco SQLite');
+  }
+  return bytes;
+}
+
+async function carregarSqlite() {
+  const { default: init } = await import(SQLITE_WASM);
+  return init({ print: () => {}, printErr: () => {} });
+}
+
+function abrirBanco(sqlite3, bytes) {
+  const banco = new sqlite3.oo1.DB();
+  const p = sqlite3.wasm.allocFromTypedArray(bytes);
+  const rc = sqlite3.capi.sqlite3_deserialize(banco.pointer, 'main', p, bytes.byteLength, bytes.byteLength,
+    sqlite3.capi.SQLITE_DESERIALIZE_FREEONCLOSE | sqlite3.capi.SQLITE_DESERIALIZE_READONLY);
+  if (rc !== 0) throw new Error(`sqlite3_deserialize retornou ${rc}`);
+  banco.selectValue('SELECT count(*) FROM atos_fts WHERE atos_fts MATCH ?', ['teste']);  // FTS5 presente
+  return banco;
+}
+
+// --------------------------------------------------------------- filtros --
+
+function preencherFiltros() {
+  const info = Object.fromEntries(db.selectArrays('SELECT key, value FROM info'));
+  const quando = info.ultimo_ato_gravado
+    ? new Date(info.ultimo_ato_gravado).toLocaleString('pt-BR',
+        { dateStyle: 'short', timeStyle: 'short', timeZone: 'America/Sao_Paulo' })
+    : '';
+  status(`${num(info.atos)} atos publicados de ${dataBR(info.data_inicial)} a ${dataBR(info.data_final)}`
+    + (quando ? ` · último ato gravado em ${quando}` : ''));
+  for (const id of ['de', 'ate']) {
+    $(id).min = info.data_inicial || '';
+    $(id).max = info.data_final || '';
+  }
+  $('tipos').innerHTML = db.selectArrays(
+    'SELECT art_type, count(*) FROM atos GROUP BY 1 ORDER BY 2 DESC, 1').map(([t, n]) =>
+    `<label class="chip"><input type="checkbox" value="${esc(t)}"><span>${esc(t)} <small>${num(n)}</small></span></label>`
+  ).join('');
+  $('unidade').insertAdjacentHTML('beforeend', db.selectArrays(
+    'SELECT unidade, count(*) FROM atos GROUP BY 1 ORDER BY 2 DESC, 1').map(([u, n]) =>
+    `<option value="${esc(u)}">${esc(u)} (${num(n)})</option>`).join(''));
+}
+
+/* Converte o que a pessoa digitou numa consulta FTS5 segura: cada palavra vira
+   uma string entre aspas (pontuação como "6.014" ou "S/A" não quebra a
+   sintaxe), "frases" ficam inteiras, palavra* é prefixo, -palavra exclui e OU
+   (ou OR) une a palavra anterior e a seguinte. */
+function montarFts(entrada, coluna) {
+  const grupos = [];
+  const excluir = [];
+  let juntar = false;
+  for (const m of entrada.matchAll(/(-?)"([^"]*)"?|(\S+)/g)) {
+    let texto;
+    let negativo = false;
+    let prefixo = false;
+    if (m[2] !== undefined) {
+      negativo = m[1] === '-';
+      texto = m[2];
+    } else {
+      let w = m[3];
+      if (w === 'OU' || w === 'OR') { juntar = grupos.length > 0; continue; }
+      if (w.length > 1 && w.startsWith('-')) { negativo = true; w = w.slice(1); }
+      prefixo = /\*$/.test(w);
+      texto = w.replace(/\*+$/, '');
+    }
+    if (!/[\p{L}\p{N}]/u.test(texto)) continue;
+    const termo = '"' + texto.replace(/"/g, '""') + '"' + (prefixo ? '*' : '');
+    if (negativo) excluir.push(termo);
+    else if (juntar) grupos[grupos.length - 1].push(termo);
+    else grupos.push([termo]);
+    juntar = false;
+  }
+  if (!grupos.length) {
+    return excluir.length ? { erro: 'Inclua ao menos uma palavra sem o sinal de menos.' } : {};
+  }
+  let expr = grupos.map((g) => (g.length > 1 ? `(${g.join(' OR ')})` : g[0])).join(' AND ');
+  if (excluir.length) expr = `(${expr}) NOT (${excluir.join(' OR ')})`;
+  if (coluna) expr = `{${coluna}} : (${expr})`;
+  return { expr };
+}
+
+function estadoAtual() {
+  return {
+    q: $('q').value.trim(),
+    em: $('em').value,
+    tipos: [...document.querySelectorAll('#tipos input:checked')].map((i) => i.value),
+    de: $('de').value,
+    ate: $('ate').value,
+    unidade: $('unidade').value,
+    ordem: $('ordem').value,
+  };
+}
+
+function salvarEstado(e) {
+  const p = new URLSearchParams();
+  if (e.q) p.set('q', e.q);
+  if (e.em) p.set('em', e.em);
+  if (e.tipos.length) p.set('tipos', e.tipos.join('|'));
+  if (e.de) p.set('de', e.de);
+  if (e.ate) p.set('ate', e.ate);
+  if (e.unidade) p.set('unidade', e.unidade);
+  if (e.ordem !== 'recentes') p.set('ordem', e.ordem);
+  const hash = p.toString();
+  history.replaceState(null, '', hash ? `#${hash}` : location.pathname + location.search);
+}
+
+function lerEstado() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  $('q').value = p.get('q') || '';
+  for (const id of ['em', 'de', 'ate', 'unidade', 'ordem']) {
+    const v = p.get(id);
+    if (v && (id === 'de' || id === 'ate' || [...$(id).options].some((o) => o.value === v))) $(id).value = v;
+  }
+  const tipos = new Set((p.get('tipos') || '').split('|'));
+  for (const i of document.querySelectorAll('#tipos input')) i.checked = tipos.has(i.value);
+}
+
+// ---------------------------------------------------------------- busca --
+
+function filtrosAtivos(e) {
+  return [e.em, e.tipos.length, e.de, e.ate, e.unidade, e.ordem !== 'recentes'].filter(Boolean).length;
+}
+
+function buscar() {
+  const e = estadoAtual();
+  salvarEstado(e);
+  const ativos = filtrosAtivos(e);
+  $('mais-filtros').querySelector('summary').textContent =
+    ativos ? `Filtros (${ativos} ${ativos === 1 ? 'ativo' : 'ativos'})` : 'Filtros';
+  const fts = e.q ? montarFts(e.q, e.em) : {};
+  if (fts.erro) return mostrarAviso(fts.erro);
+  const where = [];
+  const params = [];
+  let from = 'atos a';
+  let campos = 'a.id, a.edition_date, a.art_type, a.unidade, a.identifica, a.ementa';
+  if (fts.expr) {
+    from += ' JOIN atos_fts ON atos_fts.rowid = a.id';
+    where.push('atos_fts MATCH ?');
+    params.push(fts.expr);
+    campos += ", snippet(atos_fts, -1, char(2), char(3), '…', 30) AS trecho";
+  }
+  if (e.tipos.length) {
+    where.push(`a.art_type IN (${e.tipos.map(() => '?').join(',')})`);
+    params.push(...e.tipos);
+  }
+  if (e.de) { where.push('a.edition_date >= ?'); params.push(e.de); }
+  if (e.ate) { where.push('a.edition_date <= ?'); params.push(e.ate); }
+  if (e.unidade) { where.push('a.unidade = ?'); params.push(e.unidade); }
+  let ordem = 'a.edition_date DESC, a.id DESC';
+  if (e.ordem === 'antigos') ordem = 'a.edition_date, a.id';
+  // pesos: identificação > ementa > assinatura > corpo do texto
+  if (e.ordem === 'relevancia' && fts.expr) ordem = 'bm25(atos_fts, 10.0, 5.0, 1.0, 2.0), a.edition_date DESC';
+  const sql = `SELECT ${campos} FROM ${from}${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY ${ordem}`;
+  try {
+    resultados = db.selectObjects(sql, params);
+  } catch (err) {
+    return mostrarAviso(`Não foi possível fazer esta busca: ${err.message}`, true);
+  }
+  const n = resultados.length;
+  $('contagem').textContent = n
+    ? `${num(n)} ${n === 1 ? 'ato encontrado' : 'atos encontrados'}`
+      + (e.ordem === 'relevancia' && !fts.expr ? ' (relevância só vale com palavra-chave; ordem por data)' : '')
+    : 'Nenhum ato encontrado';
+  $('lista').innerHTML = n ? '' : '<li class="vazio">Nenhum ato atende a todos estes critérios. Ajuste ou limpe os filtros.</li>';
+  mostrados = 0;
+  mostrarMais();
+}
+
+function mostrarAviso(msg, erro = false) {
+  resultados = [];
+  $('contagem').textContent = '';
+  $('lista').innerHTML = `<li class="vazio${erro ? ' erro' : ''}">${esc(msg)}</li>`;
+  $('mais').hidden = true;
+}
+
+function marcarTrecho(t) {
+  return esc(t.replace(/\s+/g, ' ')).replace(/\u0002/g, '<mark>').replace(/\u0003/g, '</mark>');
+}
+
+function mostrarMais() {
+  const fatia = resultados.slice(mostrados, mostrados + POR_PAGINA);
+  $('lista').insertAdjacentHTML('beforeend', fatia.map((r) => {
+    const trecho = r.trecho && r.trecho.replace(/[\u0002\u0003]/g, '').trim() !== (r.identifica || '').trim()
+      ? `<span class="trecho">${marcarTrecho(r.trecho)}</span>` : '';
+    return `<li class="ato" data-id="${r.id}">
+      <button type="button" class="cabeca" aria-expanded="false">
+        <span class="meta"><span>${dataBR(r.edition_date)}</span><span class="tipo">${esc(r.art_type)}</span><span>${esc(r.unidade)}</span></span>
+        <span class="titulo">${esc(r.identifica || '(sem identificação)')}</span>
+        ${r.ementa ? `<span class="ementa">${esc(r.ementa)}</span>` : ''}
+        ${trecho}
+      </button>
+      <div class="detalhe" hidden></div>
+    </li>`;
+  }).join(''));
+  mostrados += fatia.length;
+  $('mais').hidden = mostrados >= resultados.length;
+  $('mais').textContent = `Mostrar mais (${num(Math.min(POR_PAGINA, resultados.length - mostrados))} de ${num(resultados.length - mostrados)} restantes)`;
+}
+
+function abrirAto(li) {
+  const botao = li.querySelector('.cabeca');
+  const det = li.querySelector('.detalhe');
+  const aberto = botao.getAttribute('aria-expanded') === 'true';
+  botao.setAttribute('aria-expanded', String(!aberto));
+  det.hidden = aberto;
+  if (aberto || det.dataset.carregado) return;
+  det.dataset.carregado = '1';
+  const r = db.selectObject('SELECT * FROM atos WHERE id = ?', [Number(li.dataset.id)]);
+  const partes = [
+    r.pub_name && `Edição ${esc(r.edition_number || '')} (${esc(r.pub_name)})`,
+    r.number_page && `página ${esc(r.number_page)}`,
+    `fonte: ${r.fonte === 'portal' ? 'portal in.gov.br' : 'INLABS'}`,
+    `filtro: ${esc(r.filter_names)}`,
+    esc(r.art_category),
+  ].filter(Boolean);
+  const link = /^https?:\/\//.test(r.link || '')
+    ? ` · <a href="${esc(r.link)}" target="_blank" rel="noopener">Ver no DOU ↗</a>` : '';
+  det.innerHTML = `<p class="info">${partes.join(' · ')}${link}</p>`;
+  const quadro = document.createElement('iframe');
+  quadro.title = r.identifica || 'Texto do ato';
+  // sem allow-scripts: o HTML do ato não executa código; allow-same-origin só
+  // deixa a página medir a altura do conteúdo
+  quadro.setAttribute('sandbox', 'allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+  const corpo = r.texto_html || `<pre>${esc(r.texto)}</pre>`;
+  quadro.srcdoc = `<!doctype html><meta charset="utf-8"><base target="_blank"><style>${CSS_ATO}</style>${corpo}`;
+  quadro.addEventListener('load', () => {
+    const doc = quadro.contentDocument;
+    const ajustar = () => { quadro.style.height = `${doc.documentElement.scrollHeight + 2}px`; };
+    ajustar();
+    new ResizeObserver(ajustar).observe(doc.body);
+  });
+  det.appendChild(quadro);
+}
+
+// -------------------------------------------------------------- eventos --
+
+let espera = null;
+function buscarEmBreve() {
+  clearTimeout(espera);
+  espera = setTimeout(buscar, 200);
+}
+
+function ligarEventos() {
+  $('q').addEventListener('input', buscarEmBreve);
+  $('filtros').addEventListener('change', (ev) => { if (ev.target.id !== 'q') buscar(); });
+  $('filtros').addEventListener('submit', (ev) => { ev.preventDefault(); buscar(); });
+  $('filtros').addEventListener('reset', () => setTimeout(buscar, 0));
+  $('mais').addEventListener('click', mostrarMais);
+  $('lista').addEventListener('click', (ev) => {
+    const botao = ev.target.closest('.cabeca');
+    if (botao) abrirAto(botao.closest('.ato'));
+  });
+  window.addEventListener('hashchange', () => { lerEstado(); buscar(); });
+}
+
+async function iniciar() {
+  try {
+    const [bytes, sqlite3] = await Promise.all([baixarBase(BASE_URL), carregarSqlite()]);
+    db = abrirBanco(sqlite3, bytes);
+    preencherFiltros();
+  } catch (err) {
+    status(`Não foi possível carregar a base de busca: ${err.message}. Se o sistema acabou de ser `
+      + 'atualizado, a base aparece depois da próxima execução do Clipping Diário.', true);
+    console.error(err);
+    return;
+  }
+  for (const id of CONTROLES) $(id).disabled = false;
+  lerEstado();
+  // no celular os filtros começam recolhidos, a menos que o endereço já traga algum
+  $('mais-filtros').open = matchMedia('(min-width: 900px)').matches || filtrosAtivos(estadoAtual()) > 0;
+  ligarEventos();
+  buscar();
+  $('q').focus();
+}
+
+iniciar();
+</script>
+</body>
+</html>

@@ -20,6 +20,10 @@ publico do portal (www.in.gov.br/leiturajornal) e o texto de cada ato filtrado e
 lido da pagina do ato. Achados do portal ficam com file_name 'portal:...' e o
 e-mail indica a fonte. O mesmo ato vindo das duas fontes nao e duplicado.
 
+Busca web: `export-busca` gera data/busca.sqlite.gz (so os atos, com indice FTS5),
+que o scripts/persist_db.sh grava no branch 'data' e a pagina docs/index.html
+(GitHub Pages) consulta no navegador.
+
 Politica de e-mail:
   - achados: imediato, em qualquer execucao
   - "sem novidades": na primeira execucao bem-sucedida de cada dia util (BRT)
@@ -29,11 +33,13 @@ Politica de e-mail:
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import html as html_lib
 import json
 import os
 import re
+import shutil
 import smtplib
 import sqlite3
 import sys
@@ -46,6 +52,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from io import BytesIO
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
@@ -1359,6 +1366,118 @@ def cmd_test_email(cfg: Config) -> int:
     return 0
 
 
+# ============================================================================
+# BUSCA WEB (docs/index.html le data/busca.sqlite.gz do branch 'data')
+# ============================================================================
+
+BUSCA_SCHEMA = """
+CREATE TABLE atos (
+    id             INTEGER PRIMARY KEY,
+    article_id     TEXT NOT NULL,
+    edition_date   TEXT NOT NULL,           -- ISO
+    art_type       TEXT NOT NULL,
+    unidade        TEXT NOT NULL,           -- parte de art_category abaixo da ANTT
+    art_category   TEXT, filter_names TEXT, pub_name TEXT,
+    edition_number TEXT, number_page TEXT,
+    link           TEXT,                    -- pdf_page (pagina do ato no DOU)
+    fonte          TEXT NOT NULL,           -- INLABS | portal
+    identifica     TEXT, ementa TEXT, texto TEXT, texto_html TEXT,
+    assina         TEXT, cargo TEXT
+);
+CREATE INDEX atos_data ON atos(edition_date);
+CREATE VIRTUAL TABLE atos_fts USING fts5(
+    identifica, ementa, texto, assina,
+    content='atos', content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TABLE info (key TEXT PRIMARY KEY, value TEXT);
+"""
+_ANTT = norm("Agência Nacional de Transportes Terrestres")
+SEM_UNIDADE = "(sem unidade informada)"
+
+
+def unidade_antt(art_category: str) -> str:
+    """Parte de artCategory abaixo da ANTT (ex.: 'Superintendencia de Transporte
+    Ferroviario'), o que une 'Ministerio da Infraestrutura/...' (ate 2022) e
+    'Ministerio dos Transportes/...'. O portal as vezes omite a unidade."""
+    parts = [x.strip() for x in (art_category or "").split("/")]
+    for i, part in enumerate(parts):
+        if norm(part) == _ANTT:
+            return "/".join(parts[i + 1:]) or SEM_UNIDADE
+    return art_category or SEM_UNIDADE
+
+
+def export_busca(db_path: str, out_path: str) -> int:
+    """Gera o banco da pagina de busca: so os atos de `matches` (sem os alertas de
+    PDF e sem as tabelas de controle), com indice FTS5 que ignora acentos,
+    compactado com gzip. Deterministico -- os mesmos atos geram os mesmos bytes --
+    para o persist_db.sh nao gravar um arquivo novo quando nada mudou."""
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+    except sqlite3.OperationalError as e:
+        raise SystemExit(f"O SQLite deste Python ({sqlite3.sqlite_version}) nao tem FTS5: {e}")
+    finally:
+        probe.close()
+
+    src = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
+    try:
+        rows = src.execute(
+            "SELECT * FROM matches WHERE kind='article' ORDER BY edition_date, article_id"
+        ).fetchall()
+    finally:
+        src.close()
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    tmp_db, tmp_gz = out_path + ".tmp.sqlite", out_path + ".tmp"
+    for p in (tmp_db, tmp_gz):
+        if os.path.exists(p):
+            os.remove(p)
+    dst = sqlite3.connect(tmp_db)
+    try:
+        dst.executescript(BUSCA_SCHEMA)
+        dst.executemany(
+            "INSERT INTO atos (article_id, edition_date, art_type, unidade, art_category,"
+            " filter_names, pub_name, edition_number, number_page, link, fonte, identifica,"
+            " ementa, texto, texto_html, assina, cargo)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(r["article_id"], r["edition_date"], r["art_type"] or "",
+              unidade_antt(r["art_category"]), r["art_category"], r["filter_names"],
+              r["pub_name"], r["edition_number"], r["number_page"], r["pdf_page"],
+              "portal" if (r["file_name"] or "").startswith("portal:") else "INLABS",
+              r["identifica"], r["ementa"], r["texto"], r["texto_html"], r["assina"],
+              r["cargo"]) for r in rows])
+        dst.execute("INSERT INTO atos_fts(atos_fts) VALUES('rebuild')")
+        dst.execute("INSERT INTO atos_fts(atos_fts) VALUES('optimize')")
+        info = {
+            "atos": str(len(rows)),
+            "data_inicial": rows[0]["edition_date"] if rows else "",
+            "data_final": max((r["edition_date"] for r in rows), default=""),
+            "ultimo_ato_gravado": max((r["created_ts"] for r in rows), default=""),
+        }
+        dst.executemany("INSERT INTO info VALUES (?,?)", sorted(info.items()))
+        dst.commit()
+        dst.execute("VACUUM")
+    finally:
+        dst.close()
+
+    # mtime=0 e sem nome no cabecalho: o .gz tambem e deterministico
+    with open(tmp_db, "rb") as fin, open(tmp_gz, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as gz:
+            shutil.copyfileobj(fin, gz)
+    os.remove(tmp_db)
+    os.replace(tmp_gz, out_path)
+    return len(rows)
+
+
+def cmd_export_busca(cfg: Config, out: Optional[str]) -> int:
+    out = out or os.path.join(os.path.dirname(cfg.db_path) or ".", "busca.sqlite.gz")
+    n = export_busca(cfg.db_path, out)
+    log(f"Banco de busca: {n} atos -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
+    return 0
+
+
 def parse_date(s: Optional[str]) -> date:
     """YYYY-MM-DD; vazio = hoje (BRT). Entrada invalida = mensagem clara, exit 2."""
     if not s or not s.strip():
@@ -1395,6 +1514,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sub.add_parser("test-email", help="envia um e-mail de teste")
 
+    p = sub.add_parser("export-busca", help="gera o banco da pagina de busca (docs/index.html)")
+    p.add_argument("--out", help="arquivo .sqlite.gz (padrao: busca.sqlite.gz ao lado do banco)")
+
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     if a.cmd == "run":
@@ -1407,6 +1529,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_inspect(cfg, parse_date(a.date), a.grep, max(1, a.days))
     if a.cmd == "test-email":
         return cmd_test_email(cfg)
+    if a.cmd == "export-busca":
+        return cmd_export_busca(cfg, a.out)
     return 2
 
 

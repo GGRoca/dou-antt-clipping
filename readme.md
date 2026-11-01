@@ -70,6 +70,7 @@ python clip.py backfill --start 2022-01-01 --end 2022-12-31 --max-minutes 45  # 
 python clip.py backfill                   # retoma de onde o último lote parou
 python clip.py backfill --start 2026-10-22 --end 2026-10-31 --enviar  # repõe lacuna e envia
 python clip.py test-email                 # valida SMTP
+python clip.py export-busca               # gera data/busca.sqlite.gz (página de busca)
 python -m pytest -q                       # testes (INLABS e portal simulados)
 ```
 
@@ -91,6 +92,29 @@ Localmente, exporte `INLABS_EMAIL`, `INLABS_PASSWORD`, `SMTP_USER`, `SMTP_PASS`.
   gravado como `backfill` no mesmo intervalo. Um backfill avulso com data inicial que
   termina inteiro não altera o ponto de retomada de outro backfill em andamento.
 
+## Busca web
+
+A página `docs/index.html` pesquisa os atos gravados em `matches` por palavra-chave
+(em todo o ato, só na identificação, na ementa ou na assinatura), tipo de ato, período,
+unidade da ANTT e ordem (data ou relevância), e abre cada ato formatado como no DOU, com
+o link para a página oficial. O endereço da página guarda os filtros, então uma busca
+pode ser salva nos favoritos ou enviada a alguém.
+
+- A cada execução, o `scripts/persist_db.sh` roda `clip.py export-busca` e grava
+  `data/busca.sqlite.gz` no branch `data` junto com o banco: só os atos (sem alertas de
+  PDF nem tabelas de controle), com índice de texto completo FTS5 que ignora acentos,
+  compactado. O arquivo é determinístico, então só gera commit quando um ato muda. Se a
+  geração falhar, o banco principal é gravado mesmo assim e o passo termina com erro.
+- A página baixa esse arquivo de `raw.githubusercontent.com` (cerca de 4 MB hoje) e
+  consulta tudo no navegador com o SQLite oficial em WebAssembly
+  (`@sqlite.org/sqlite-wasm`, versão fixa, via jsDelivr). Não há servidor nem segredo.
+  O GitHub guarda o arquivo em cache por até 5 minutos.
+- Publicação: **Settings → Pages → Build and deployment → Source: Deploy from a branch →
+  Branch: `main`, pasta `/docs` → Save**. A página fica em
+  `https://ggroca.github.io/dou-antt-clipping/`. Ela é pública, como o repositório e o
+  banco já são.
+- Teste com outro arquivo: `index.html?base=<url do .sqlite.gz>`.
+
 ## Banco de dados
 
 - `runs` — uma linha por execução: `status` (`ok`, `portal`, `inlabs_unavailable`, `portal_unavailable`, `error`), arquivos, novos matches, e-mails.
@@ -107,6 +131,7 @@ clip.py                     # todo o sistema
 config.yml                  # filtros, e-mail, janela
 tests/test_clip.py          # parser, filtros, banco, e-mail, cliente (servidor falso)
 scripts/restore_db.sh       # branch data -> data/clipping.sqlite
-scripts/persist_db.sh       # data/clipping.sqlite -> branch data
+scripts/persist_db.sh       # data/clipping.sqlite e data/busca.sqlite.gz -> branch data
+docs/index.html             # página de busca (GitHub Pages)
 .github/workflows/          # daily.yml, backfill.yml
 ```

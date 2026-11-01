@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
 # Grava data/clipping.sqlite no branch 'data' usando um worktree separado
-# (nao mexe no checkout principal). Idempotente: sem mudanca, sem commit
+# (nao mexe no checkout principal), junto com data/busca.sqlite.gz, o banco da
+# pagina de busca (docs/index.html). Idempotente: sem mudanca, sem commit
 # e sem acesso a rede.
 set -euo pipefail
 DB=data/clipping.sqlite
+BUSCA=data/busca.sqlite.gz
 if [ ! -f "$DB" ]; then
   echo "Sem $DB para persistir"; exit 0
 fi
 if [ -f "$DB.restored" ] && cmp -s "$DB" "$DB.restored"; then
   echo "Banco sem alteracoes (identico ao restaurado)"; exit 0
 fi
+
+# Banco da busca web. Se a geracao falhar, o banco principal e gravado mesmo
+# assim (o estado do clipping nao pode se perder) e o passo termina com erro.
+busca_ok=1
+if ! python clip.py export-busca --out "$BUSCA"; then
+  echo "::error::Falha ao gerar $BUSCA; o banco principal sera gravado sem ele"
+  rm -f "$BUSCA"
+  busca_ok=0
+fi
+fim() {
+  if [ "$busca_ok" -eq 0 ]; then
+    echo "Banco de busca nao foi atualizado"; exit 1
+  fi
+  exit 0
+}
+add_files() {
+  git add -f "$DB"
+  if [ -f "$BUSCA" ]; then git add -f "$BUSCA"; fi
+}
 
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -36,23 +57,24 @@ esac
 
 mkdir -p "$WT/data"
 cp "$DB" "$WT/$DB"
+if [ -f "$BUSCA" ]; then cp "$BUSCA" "$WT/$BUSCA"; fi
 cd "$WT"
-git add -f "$DB"
+add_files
 if git diff --cached --quiet; then
-  echo "Banco sem alteracoes"; exit 0
+  echo "Banco sem alteracoes"; fim
 fi
 MSG="Update database [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
 git commit --quiet -m "$MSG"
 
 for i in 1 2 3; do
   if git push --quiet origin HEAD:data; then
-    echo "Banco persistido no branch 'data'"; exit 0
+    echo "Banco persistido no branch 'data'"; fim
   fi
   echo "push falhou (tentativa $i) -- reaplicando em cima do remoto"
   sleep $((i * 5))
   git fetch --quiet origin data
   git reset --quiet --soft FETCH_HEAD
-  git add -f "$DB"
+  add_files
   git commit --quiet -m "$MSG" || true
 done
 echo "Nao foi possivel persistir o banco"; exit 1
