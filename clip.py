@@ -1240,6 +1240,14 @@ def cmd_backfill(cfg: Config, start: Optional[date], end: Optional[date], fonte:
     stats = RunStats()
     status = "ok"
     emailed_ts = None if enviar else "backfill"
+    if enviar:   # achados do intervalo gravados antes por um backfill sem e-mail tambem vao
+        cur = db.con.execute(
+            "UPDATE matches SET emailed_ts=NULL WHERE emailed_ts='backfill' "
+            "AND edition_date BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))
+        db.con.commit()
+        if cur.rowcount:
+            log(f"  {cur.rowcount} achado(s) ja no banco como 'backfill' voltam a ficar pendentes de e-mail")
+            stats.notes.append(f"{cur.rowcount} achado(s) 'backfill' marcados para e-mail")
     t0 = time.monotonic()
     d = start
     proximo: Optional[date] = None
@@ -1273,8 +1281,11 @@ def cmd_backfill(cfg: Config, start: Optional[date], end: Optional[date], fonte:
         stats.errors.append(f"{type(e).__name__}: {str(e)[:300]}")
         traceback.print_exc()
 
-    db.set("backfill_next", proximo.isoformat() if proximo else None)
-    db.set("backfill_end", end.isoformat() if proximo else None)
+    # Um backfill avulso (com data inicial) que termina inteiro nao mexe no ponto de
+    # retomada de outro backfill em andamento.
+    if retomando or proximo is not None:
+        db.set("backfill_next", proximo.isoformat() if proximo else None)
+        db.set("backfill_end", end.isoformat() if proximo else None)
     ultimo = (proximo or end + timedelta(days=1)) - timedelta(days=1)
     feito = f"{start}..{ultimo}" if ultimo >= start else "nenhuma data"
     situacao = "concluido" if proximo is None else ("parcial" if status == "ok" else status)

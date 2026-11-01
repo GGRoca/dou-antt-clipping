@@ -87,7 +87,9 @@ Localmente, exporte `INLABS_EMAIL`, `INLABS_PASSWORD`, `SMTP_USER`, `SMTP_PASS`.
   erro numa data ou lote cancelado na fila), rode de novo com a data inicial em branco
   para retomar. Sem `enviar_email`, os achados ficam marcados como `backfill` e nunca
   são enviados; com ele, ficam pendentes e saem no próximo e-mail do Clipping Diário
-  (use para repor uma lacuna recente).
+  (use para repor uma lacuna recente) — inclusive os que um backfill anterior já tinha
+  gravado como `backfill` no mesmo intervalo. Um backfill avulso com data inicial que
+  termina inteiro não altera o ponto de retomada de outro backfill em andamento.
 
 ## Banco de dados
 

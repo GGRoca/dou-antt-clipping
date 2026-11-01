@@ -1115,3 +1115,23 @@ storage: {db_path: x.sqlite}
                "--fonte", "inlabs", "--max-minutes", "45", "--enviar"])
     assert calls[0] == (None, None, {"fonte": "portal", "max_minutes": 0, "enviar": False})
     assert calls[1] == (date(2022, 1, 1), date(2022, 1, 31), {"fonte": "inlabs", "max_minutes": 45, "enviar": True})
+
+
+def test_backfill_enviar_requeues_existing_backfill_matches_and_keeps_resume_point(tmp_path, monkeypatch, portal):
+    """01/11/2026: backfill de 2022 ate hoje sem e-mail em andamento; a lacuna recente
+    (ja gravada como 'backfill') deve sair por e-mail sem perder o ponto de retomada."""
+    portal.down = False
+    portal.add(D_PORTAL, "do1", SUFER_ITEM, SUFER_TEXTO)
+    monkeypatch.setattr(clip.time, "sleep", lambda s: None)
+    cfg = make_config(tmp_path)
+    assert clip.cmd_backfill(cfg, D_PORTAL, D_PORTAL) == 0               # sem e-mail
+    db = clip.Storage(cfg.db_path)
+    assert db.pending_matches() == []
+    db.set("backfill_next", "2024-01-01"); db.set("backfill_end", "2026-11-01")
+    db.close()
+    n = len(portal.requests)
+    assert clip.cmd_backfill(cfg, date(2026, 10, 22), date(2026, 10, 31), enviar=True) == 0
+    db = clip.Storage(cfg.db_path)
+    assert [r["article_id"] for r in db.pending_matches()] == [f"portal:{SUFER_URL}"]
+    assert act_pages(portal, n) == []                                     # nada baixado de novo
+    assert (db.get("backfill_next"), db.get("backfill_end")) == ("2024-01-01", "2026-11-01")
